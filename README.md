@@ -16,6 +16,7 @@ Projeto local para consolidar dados da Bradial com o ClickUp do workspace `Alem 
 - exibe dashboard, excecoes, logs e leads enriquecidos
 - lista tasks do ClickUp que ainda precisam virar contato no Bradial
 - cria ou atualiza contato no Bradial com a label `OPORTUNIDADE`, sem enviar mensagem
+- gera URL por integracao para cadastro de webhook no ClickUp
 
 ## Seguranca
 
@@ -43,11 +44,13 @@ Variaveis principais:
 - `BRADIAL_API_TOKEN`
 - `BRADIAL_INBOX_ID`
 - `BRADIAL_OPPORTUNITY_LABEL`
+- `PUBLIC_BASE_URL`
 - `CLICKUP_API_KEY`
 - `CLICKUP_WORKSPACE_NAME`
 - `CLICKUP_COMMERCIAL_SPACE_NAME`
 - `CLICKUP_COMMERCIAL_FOLDER_NAME`
 - `CLICKUP_WEBHOOK_SECRET`
+- `CLICKUP_INTEGRATIONS_PATH`
 
 Opcionalmente, em vez de `CLICKUP_API_KEY`, o backend pode usar:
 
@@ -79,6 +82,10 @@ npm run dev
 - `GET /clickup/navigation`
 - `GET /clickup/tasks`
 - `GET /clickup/pending-contacts`
+- `GET /clickup/webhook-integrations`
+- `POST /clickup/webhook-integrations`
+- `PATCH /clickup/webhook-integrations/:integrationId`
 - `POST /clickup/tasks/:taskId/sync-to-bradial`
 - `POST /webhooks/clickup`
+- `POST /webhooks/clickup/:integrationId/:webhookToken`
 - `POST /refresh`

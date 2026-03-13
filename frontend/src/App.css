@@ -345,16 +345,39 @@ button:disabled {
   color: #bfd7e3;
 }
 
+.webhook-box {
+  display: grid;
+  gap: 0.45rem;
+  padding: 1rem;
+  border-radius: 1rem;
+  background: rgba(5, 9, 13, 0.72);
+  border: 1px dashed rgba(214, 226, 233, 0.12);
+}
+
+.webhook-box p,
+.webhook-box small {
+  margin: 0;
+  color: var(--muted);
+}
+
+.webhook-box code,
+.webhook-card code {
+  word-break: break-all;
+  color: #bfd7e3;
+}
+
 .exception-list,
 .logs-panel,
 .lead-list,
-.opportunity-list {
+.opportunity-list,
+.webhook-list {
   display: grid;
   gap: 0.8rem;
 }
 
 .exception-card,
 .opportunity-card,
+.webhook-card,
 .lead-list-item,
 .lead-detail,
 .log-row,
@@ -371,6 +394,12 @@ button:disabled {
 .opportunity-card {
   display: grid;
   gap: 0.85rem;
+  padding: 1rem;
+}
+
+.webhook-card {
+  display: grid;
+  gap: 0.6rem;
   padding: 1rem;
 }
 

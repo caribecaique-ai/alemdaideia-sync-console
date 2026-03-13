@@ -74,6 +74,12 @@ function App() {
   const [health, setHealth] = usePersistentState('health', initialHealth)
   const [leads, setLeads] = usePersistentState('leads', bootInLiveMode ? [] : initialLeads)
   const [pendingContacts, setPendingContacts] = usePersistentState('pendingContacts', [])
+  const [webhookRegistry, setWebhookRegistry] = usePersistentState('webhookRegistry', {
+    publicBaseUrl: '',
+    source: null,
+    isPublic: false,
+    items: [],
+  })
   const [exceptions, setExceptions] = usePersistentState(
     'exceptions',
     bootInLiveMode ? [] : initialExceptions,
@@ -86,6 +92,7 @@ function App() {
   const [leadSearch, setLeadSearch] = useState('')
   const [connectionState, setConnectionState] = useState('idle')
   const [syncingTaskId, setSyncingTaskId] = useState(null)
+  const [creatingWebhookUrl, setCreatingWebhookUrl] = useState(false)
 
   const deferredLeadSearch = useDeferredValue(leadSearch)
   const selectedLead =
@@ -126,10 +133,16 @@ function App() {
     setHealth(initialHealth)
     setLeads(initialLeads)
     setPendingContacts([])
+    setWebhookRegistry({
+      publicBaseUrl: '',
+      source: null,
+      isPublic: false,
+      items: [],
+    })
     setExceptions(initialExceptions)
     setLogs(initialLogs)
     setSelectedLeadId(initialLeads[0]?.id ?? null)
-  }, [config.mode, setExceptions, setHealth, setLeads, setLogs, setPendingContacts, setSelectedLeadId])
+  }, [config.mode, setExceptions, setHealth, setLeads, setLogs, setPendingContacts, setSelectedLeadId, setWebhookRegistry])
 
   const pushLog = useEffectEvent((entry) => {
     setLogs((current) => [entry, ...current].slice(0, 120))
@@ -265,33 +278,58 @@ function App() {
 
     try {
       const baseUrl = config.backendUrl.replace(/\/$/, '')
-      const [leadsResponse, exceptionsResponse, logsResponse, pendingContactsResponse] = await Promise.all([
+      const [
+        leadsResponse,
+        exceptionsResponse,
+        logsResponse,
+        pendingContactsResponse,
+        webhookIntegrationsResponse,
+      ] = await Promise.all([
         fetch(`${baseUrl}/leads`),
         fetch(`${baseUrl}/exceptions`),
         fetch(`${baseUrl}/logs`),
         fetch(`${baseUrl}/clickup/pending-contacts`),
+        fetch(`${baseUrl}/clickup/webhook-integrations`),
       ])
 
       if (
         !leadsResponse.ok ||
         !exceptionsResponse.ok ||
         !logsResponse.ok ||
-        !pendingContactsResponse.ok
+        !pendingContactsResponse.ok ||
+        !webhookIntegrationsResponse.ok
       ) {
         throw new Error('Um dos endpoints respondeu com erro')
       }
 
-      const [nextLeads, nextExceptions, nextLogs, nextPendingContacts] = await Promise.all([
+      const [
+        nextLeads,
+        nextExceptions,
+        nextLogs,
+        nextPendingContacts,
+        nextWebhookRegistry,
+      ] = await Promise.all([
         leadsResponse.json(),
         exceptionsResponse.json(),
         logsResponse.json(),
         pendingContactsResponse.json(),
+        webhookIntegrationsResponse.json(),
       ])
 
       setLeads(Array.isArray(nextLeads) ? nextLeads : [])
       setExceptions(Array.isArray(nextExceptions) ? nextExceptions : [])
       setLogs(Array.isArray(nextLogs) ? nextLogs : [])
       setPendingContacts(Array.isArray(nextPendingContacts) ? nextPendingContacts : [])
+      setWebhookRegistry(
+        nextWebhookRegistry && typeof nextWebhookRegistry === 'object'
+          ? nextWebhookRegistry
+          : {
+              publicBaseUrl: '',
+              source: null,
+              isPublic: false,
+              items: [],
+            },
+      )
 
       if (!silent) {
         pushLog(
@@ -593,6 +631,57 @@ function App() {
     }
   }
 
+  const handleGenerateWebhookUrl = async () => {
+    if (config.mode !== 'live' || !config.backendUrl.trim()) {
+      pushLog(
+        createLog(
+          'warning',
+          'Geracao indisponivel',
+          'Use o modo live com backend configurado para gerar a URL do webhook.',
+        ),
+      )
+      return
+    }
+
+    setCreatingWebhookUrl(true)
+
+    try {
+      const baseUrl = config.backendUrl.replace(/\/$/, '')
+      const response = await fetch(`${baseUrl}/clickup/webhook-integrations`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({}),
+      })
+      const payload = await response.json().catch(() => ({}))
+
+      if (!response.ok) {
+        throw new Error(payload.error || `HTTP ${response.status}`)
+      }
+
+      await pullLiveData(true)
+      pushLog(
+        createLog(
+          payload.warning ? 'warning' : 'success',
+          'URL de webhook gerada',
+          payload.warning ||
+            `Nova URL pronta para cadastro no ClickUp: ${payload.integration?.webhookUrl || 'sem url'}`,
+        ),
+      )
+    } catch (error) {
+      pushLog(
+        createLog(
+          'error',
+          'Falha ao gerar URL do webhook',
+          error.message || 'Nao foi possivel criar a integracao do ClickUp.',
+        ),
+      )
+    } finally {
+      setCreatingWebhookUrl(false)
+    }
+  }
+
   const clearLogs = () => {
     setLogs([])
   }
@@ -726,6 +815,56 @@ function App() {
                   }
                 />
               </label>
+            </div>
+          </section>
+
+          <section className="panel section-card">
+            <div className="section-heading">
+              <div>
+                <p className="eyebrow">Webhook</p>
+                <h2>URL por integracao</h2>
+              </div>
+              <button
+                className="ghost-button"
+                type="button"
+                disabled={config.mode !== 'live' || creatingWebhookUrl}
+                onClick={() => void handleGenerateWebhookUrl()}
+              >
+                {creatingWebhookUrl ? 'Gerando...' : 'Gerar URL'}
+              </button>
+            </div>
+
+            <div className="webhook-box">
+              <p>Base publica detectada</p>
+              <code>{webhookRegistry.publicBaseUrl || 'nao resolvida'}</code>
+              <small>
+                {webhookRegistry.source
+                  ? `origem: ${webhookRegistry.source}${webhookRegistry.isPublic ? '' : ' (ainda nao publica)'}`
+                  : 'gere uma integracao para resolver a URL'}
+              </small>
+            </div>
+
+            <div className="webhook-list">
+              {Array.isArray(webhookRegistry.items) && webhookRegistry.items.length > 0 ? (
+                webhookRegistry.items.map((item) => (
+                  <article key={item.integrationId} className="webhook-card">
+                    <div className="exception-meta">
+                      <span className={`pill ${item.status === 'active' ? 'pill-success' : 'pill-risk'}`}>
+                        {item.status}
+                      </span>
+                      <span>{item.authMode}</span>
+                    </div>
+                    <strong>{item.name}</strong>
+                    <code>{item.webhookUrl}</code>
+                    <small>{item.workspaceName || 'workspace nao identificado'}</small>
+                  </article>
+                ))
+              ) : (
+                <div className="empty-state">
+                  <strong>Nenhuma URL gerada</strong>
+                  <p>Crie uma integracao para copiar a URL e cadastrar no ClickUp.</p>
+                </div>
+              )}
             </div>
           </section>
 

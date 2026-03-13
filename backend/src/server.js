@@ -1,9 +1,11 @@
 import crypto from 'node:crypto'
+import path from 'node:path'
 import Fastify from 'fastify'
 import cors from '@fastify/cors'
 import dotenv from 'dotenv'
 import { createBradialAdapter } from './adapters/bradial.js'
 import { createClickupAdapter } from './adapters/clickup.js'
+import { createClickupIntegrationStore } from './services/clickupIntegrations.js'
 import { buildConsolidatedSnapshot } from './services/consolidation.js'
 import { normalizePhone } from './utils/normalizers.js'
 
@@ -15,6 +17,10 @@ const BRADIAL_REFRESH_MS = Math.max(15_000, Number(process.env.BRADIAL_REFRESH_M
 const BRADIAL_OPPORTUNITY_LABEL =
   String(process.env.BRADIAL_OPPORTUNITY_LABEL || 'OPORTUNIDADE').trim() || 'OPORTUNIDADE'
 const CLICKUP_WEBHOOK_SECRET = String(process.env.CLICKUP_WEBHOOK_SECRET || '').trim()
+const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || '').trim()
+const CLICKUP_INTEGRATIONS_PATH =
+  String(process.env.CLICKUP_INTEGRATIONS_PATH || '').trim() ||
+  path.resolve(process.cwd(), 'runtime-data', 'clickup-integrations.json')
 
 const app = Fastify({ logger: false })
 
@@ -96,6 +102,13 @@ const clickup = createClickupAdapter(
     maxListPages: process.env.CLICKUP_MAX_LIST_PAGES,
     backupClientName: process.env.CLICKUP_BACKUP_CLIENT_NAME,
     clientsBackupPath: process.env.CLICKUP_CLIENTS_BACKUP_PATH,
+  },
+  pushLog,
+)
+
+const clickupIntegrations = createClickupIntegrationStore(
+  {
+    storePath: CLICKUP_INTEGRATIONS_PATH,
   },
   pushLog,
 )
@@ -201,6 +214,34 @@ function buildClickupWebhookKey(payload) {
   return [payload?.webhook_id || 'clickup', event, taskId, historyItemId].join(':')
 }
 
+function extractClickupWebhookEnvelope(payload) {
+  const automationTaskId = String(payload?.payload?.id || '').trim()
+  if (automationTaskId) {
+    return {
+      mode: 'automation',
+      event: 'automation_call_webhook',
+      taskId: automationTaskId,
+      webhookKey: [
+        payload?.auto_id || 'automation',
+        payload?.trigger_id || 'trigger',
+        payload?.date || 'no-date',
+        automationTaskId,
+      ].join(':'),
+    }
+  }
+
+  return {
+    mode: 'api',
+    event: String(payload?.event || '').trim(),
+    taskId: String(payload?.task_id || payload?.taskId || payload?.task?.id || '').trim(),
+    webhookKey: buildClickupWebhookKey(payload),
+  }
+}
+
+function buildIntegrationWebhookKey(integrationId, payload) {
+  return `${integrationId}:${buildClickupWebhookKey(payload)}`
+}
+
 function rememberWebhookKey(webhookKey) {
   if (!webhookKey) return false
   if (runtime.processedWebhookKeys.includes(webhookKey)) return true
@@ -210,15 +251,14 @@ function rememberWebhookKey(webhookKey) {
   return false
 }
 
-function validateClickupWebhookSignature(request) {
-  if (!CLICKUP_WEBHOOK_SECRET) {
+function validateClickupWebhookSignature(rawBody, signature, secret) {
+  if (!secret) {
     return {
       ok: false,
       reason: 'missing_secret',
     }
   }
 
-  const signature = String(request.headers['x-signature'] || '').trim()
   if (!signature) {
     return {
       ok: false,
@@ -227,8 +267,8 @@ function validateClickupWebhookSignature(request) {
   }
 
   const expected = crypto
-    .createHmac('sha256', CLICKUP_WEBHOOK_SECRET)
-    .update(request.rawBody || '')
+    .createHmac('sha256', secret)
+    .update(rawBody || '')
     .digest('hex')
 
   if (signature.length !== expected.length) {
@@ -241,6 +281,53 @@ function validateClickupWebhookSignature(request) {
   return {
     ok: crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected)),
     reason: 'invalid_signature',
+  }
+}
+
+async function resolvePublicBaseUrl() {
+  if (PUBLIC_BASE_URL) {
+    return {
+      publicBaseUrl: PUBLIC_BASE_URL.replace(/\/$/, ''),
+      source: 'env:PUBLIC_BASE_URL',
+      isPublic: !/localhost|127\.0\.0\.1|0\.0\.0\.0/.test(PUBLIC_BASE_URL),
+    }
+  }
+
+  try {
+    const response = await fetch('http://127.0.0.1:4040/api/tunnels')
+    if (response.ok) {
+      const payload = await response.json()
+      const tunnels = Array.isArray(payload?.tunnels) ? payload.tunnels : []
+      const httpsTunnel =
+        tunnels.find((item) => String(item.proto || '').toLowerCase() === 'https') || tunnels[0]
+
+      if (httpsTunnel?.public_url) {
+        return {
+          publicBaseUrl: String(httpsTunnel.public_url).replace(/\/$/, ''),
+          source: 'ngrok',
+          isPublic: true,
+        }
+      }
+    }
+  } catch {}
+
+  return {
+    publicBaseUrl: `http://localhost:${PORT}`,
+    source: 'localhost',
+    isPublic: false,
+  }
+}
+
+function validateClickupIntegrationRequest(request, integration) {
+  const signature = String(request.headers['x-signature'] || '').trim()
+
+  if (integration?.clickupSecret) {
+    return validateClickupWebhookSignature(request.rawBody || '', signature, integration.clickupSecret)
+  }
+
+  return {
+    ok: true,
+    reason: 'token_only',
   }
 }
 
@@ -451,6 +538,69 @@ app.get('/clickup/pending-contacts', async () => {
   return runtime.cache.clickup.pendingContacts
 })
 
+app.get('/clickup/webhook-integrations', async () => {
+  if (!runtime.lastRefreshAt) await ensureSnapshot('clickup-webhook-integrations-bootstrap')
+
+  const publicUrl = await resolvePublicBaseUrl()
+
+  return {
+    publicBaseUrl: publicUrl.publicBaseUrl,
+    source: publicUrl.source,
+    isPublic: publicUrl.isPublic,
+    items: clickupIntegrations.listIntegrations(),
+  }
+})
+
+app.post('/clickup/webhook-integrations', async (request) => {
+  if (!runtime.lastRefreshAt) await ensureSnapshot('clickup-webhook-integration-create-bootstrap')
+
+  const publicUrl = await resolvePublicBaseUrl()
+  const lists = runtime.cache.clickup.navigation?.lists || []
+  const body = request.body || {}
+
+  const integration = clickupIntegrations.createIntegration({
+    name:
+      body.name ||
+      `${runtime.cache.clickup.health?.workspaceName || 'ClickUp'} webhook ${new Date().toLocaleDateString('pt-BR')}`,
+    publicBaseUrl: String(body.publicBaseUrl || publicUrl.publicBaseUrl).trim(),
+    workspaceId: body.workspaceId || runtime.cache.clickup.health?.workspaceId || null,
+    workspaceName: body.workspaceName || runtime.cache.clickup.health?.workspaceName || null,
+    lists,
+    clickupSecret: body.clickupSecret || null,
+  })
+
+  return {
+    ok: true,
+    integration,
+    source: publicUrl.source,
+    isPublic: publicUrl.isPublic,
+    warning: publicUrl.isPublic
+      ? null
+      : 'A URL gerada ainda aponta para localhost. Suba um tunel ou configure PUBLIC_BASE_URL antes de usar no ClickUp.',
+  }
+})
+
+app.patch('/clickup/webhook-integrations/:integrationId', async (request, reply) => {
+  const integrationId = String(request.params.integrationId || '').trim()
+  const body = request.body || {}
+  const updated = clickupIntegrations.updateIntegration(integrationId, {
+    clickupSecret: body.clickupSecret,
+    status: body.status,
+    publicBaseUrl: body.publicBaseUrl,
+    name: body.name,
+  })
+
+  if (!updated) {
+    reply.code(404)
+    return { error: 'Integracao nao encontrada.' }
+  }
+
+  return {
+    ok: true,
+    integration: updated,
+  }
+})
+
 app.post('/clickup/tasks/:taskId/sync-to-bradial', async (request, reply) => {
   const taskId = String(request.params.taskId || '').trim()
   const dryRun = parseBooleanFlag(request.query?.dryRun || request.body?.dryRun)
@@ -504,7 +654,11 @@ app.post('/clickup/tasks/:taskId/sync-to-bradial', async (request, reply) => {
 })
 
 app.post('/webhooks/clickup', async (request, reply) => {
-  const signatureCheck = validateClickupWebhookSignature(request)
+  const signatureCheck = validateClickupWebhookSignature(
+    request.rawBody || '',
+    String(request.headers['x-signature'] || '').trim(),
+    CLICKUP_WEBHOOK_SECRET,
+  )
 
   if (!signatureCheck.ok) {
     reply.code(signatureCheck.reason === 'missing_secret' ? 503 : 401)
@@ -571,6 +725,107 @@ app.post('/webhooks/clickup', async (request, reply) => {
         pushLog('error', 'Falha no webhook ClickUp', error.message, {
           event,
           taskId,
+        })
+      })
+  })
+
+  return reply
+})
+
+app.post('/webhooks/clickup/:integrationId/:webhookToken', async (request, reply) => {
+  const integrationId = String(request.params.integrationId || '').trim()
+  const webhookToken = String(request.params.webhookToken || '').trim()
+  const integration = clickupIntegrations.findByWebhookPath(integrationId, webhookToken)
+
+  if (!integration) {
+    reply.code(404)
+    return {
+      error: 'Integracao ClickUp nao encontrada ou inativa.',
+    }
+  }
+
+  const signatureCheck = validateClickupIntegrationRequest(request, integration)
+
+  if (!signatureCheck.ok) {
+    reply.code(401)
+    return {
+      error: 'Assinatura X-Signature invalida para esta integracao do ClickUp.',
+    }
+  }
+
+  const payload = request.body || {}
+  const envelope = extractClickupWebhookEnvelope(payload)
+  const webhookKey = buildIntegrationWebhookKey(integration.integrationId, {
+    webhook_id: integration.integrationId,
+    event: envelope.event,
+    task_id: envelope.taskId,
+    history_items: [{ id: envelope.webhookKey }],
+  })
+
+  if (rememberWebhookKey(webhookKey)) {
+    return {
+      ok: true,
+      duplicate: true,
+      integrationId: integration.integrationId,
+      event: envelope.event || null,
+      taskId: envelope.taskId || null,
+    }
+  }
+
+  const event = envelope.event
+  const taskId = envelope.taskId
+
+  clickupIntegrations.markIntegrationEvent(integration.integrationId)
+
+  reply.code(202).send({
+    ok: true,
+    accepted: true,
+    integrationId: integration.integrationId,
+    authMode: integration.authMode,
+    mode: envelope.mode,
+    event,
+    taskId: taskId || null,
+  })
+
+  queueMicrotask(() => {
+    const supportedEvents = ['taskCreated', 'taskUpdated', 'taskStatusUpdated', 'automation_call_webhook']
+
+    if (!supportedEvents.includes(event)) {
+      pushLog('info', 'Webhook ClickUp ignorado', `Evento ${event} fora do escopo de sync.`, {
+        event,
+        integrationId: integration.integrationId,
+      })
+      return
+    }
+
+    if (!taskId) {
+      pushLog('warning', 'Webhook ClickUp sem task_id', 'Payload recebido sem task_id.', {
+        event,
+        integrationId: integration.integrationId,
+      })
+      return
+    }
+
+    syncClickupTaskToBradial(taskId, {
+      dryRun: false,
+      trigger: `clickup-webhook-${integration.integrationId}-${event}`,
+      refreshBefore: true,
+    })
+      .then((result) => {
+        if (result.skipped) {
+          pushLog('info', 'Webhook ClickUp ignorado', `Task ${taskId} ignorada: ${result.reason}.`, {
+            event,
+            taskId,
+            reason: result.reason,
+            integrationId: integration.integrationId,
+          })
+        }
+      })
+      .catch((error) => {
+        pushLog('error', 'Falha no webhook ClickUp', error.message, {
+          event,
+          taskId,
+          integrationId: integration.integrationId,
         })
       })
   })
