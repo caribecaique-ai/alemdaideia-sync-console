@@ -1,0 +1,15 @@
+{
+  "name": "bradial_clickup_sync_backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node src/server.js",
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.1.0",
+    "dotenv": "^17.3.1",
+    "fastify": "^5.7.4"
+  }
+}

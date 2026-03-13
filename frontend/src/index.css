@@ -1,0 +1,57 @@
+:root {
+  font-family: 'Aptos', 'Segoe UI', sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  color: #edf5f9;
+  background:
+    radial-gradient(circle at top, rgba(246, 188, 66, 0.1), transparent 35%),
+    linear-gradient(180deg, #081116 0%, #060d11 100%);
+  color-scheme: dark;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  --text: #edf5f9;
+  --muted: #adc0cb;
+  --soft: #8196a3;
+  --accent: #f6bc42;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+  background-color: #060d11;
+  color: var(--text);
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+  background-size: 26px 26px;
+}
+
+a {
+  color: inherit;
+}
+
+img,
+picture,
+svg {
+  display: block;
+  max-width: 100%;
+}
+
+code {
+  font-family: 'Cascadia Code', 'Consolas', monospace;
+}
+
+#root {
+  min-height: 100vh;
+}
