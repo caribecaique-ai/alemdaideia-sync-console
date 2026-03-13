@@ -99,7 +99,7 @@
 
 .summary-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: 1rem;
   margin-top: 1rem;
 }
@@ -231,6 +231,13 @@ button:hover {
   transform: translateY(-1px);
 }
 
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+  filter: none;
+  transform: none;
+}
+
 .ghost-button {
   background: rgba(255, 255, 255, 0.04);
   color: var(--text);
@@ -340,12 +347,14 @@ button:hover {
 
 .exception-list,
 .logs-panel,
-.lead-list {
+.lead-list,
+.opportunity-list {
   display: grid;
   gap: 0.8rem;
 }
 
 .exception-card,
+.opportunity-card,
 .lead-list-item,
 .lead-detail,
 .log-row,
@@ -359,17 +368,48 @@ button:hover {
   padding: 1rem;
 }
 
+.opportunity-card {
+  display: grid;
+  gap: 0.85rem;
+  padding: 1rem;
+}
+
 .exception-card strong,
 .log-content strong {
   display: block;
 }
 
 .exception-card p,
+.opportunity-card p,
 .lead-notes p,
 .log-content p,
 .mini-log-item p {
   margin: 0.4rem 0 0;
   color: var(--muted);
+}
+
+.opportunity-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  color: var(--soft);
+  font-size: 0.88rem;
+}
+
+.opportunity-actions {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: center;
+}
+
+.inline-link {
+  color: #9fe7ff;
+  text-decoration: none;
+}
+
+.inline-link:hover {
+  text-decoration: underline;
 }
 
 .exception-meta,
@@ -517,7 +557,8 @@ button:hover {
 
   .hero-bar,
   .lead-detail-header,
-  .section-heading {
+  .section-heading,
+  .opportunity-actions {
     flex-direction: column;
     align-items: stretch;
   }

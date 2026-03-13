@@ -1,6 +1,6 @@
 # Alem da Ideia Sync Console
 
-Projeto local para consolidar dados da Bradial com o ClickUp do workspace `Além da Ideia`.
+Projeto local para consolidar dados da Bradial com o ClickUp do workspace `Alem da Ideia`.
 
 ## Estrutura
 
@@ -10,10 +10,12 @@ Projeto local para consolidar dados da Bradial com o ClickUp do workspace `Além
 ## O que ja faz
 
 - conecta na Bradial Partner API
-- conecta no ClickUp com escopo do workspace `Além da Ideia`
+- conecta no ClickUp com escopo do workspace `Alem da Ideia`
 - limita a leitura comercial ao space `COMERCIAL` e pasta `Area de Vendas`
 - cruza contatos e tasks por telefone normalizado em `E.164`
 - exibe dashboard, excecoes, logs e leads enriquecidos
+- lista tasks do ClickUp que ainda precisam virar contato no Bradial
+- cria ou atualiza contato no Bradial com a label `OPORTUNIDADE`, sem enviar mensagem
 
 ## Seguranca
 
@@ -21,6 +23,7 @@ Projeto local para consolidar dados da Bradial com o ClickUp do workspace `Além
 - a leitura da Bradial depende apenas do que a `x-api-key` autenticada pode acessar
 - a leitura do ClickUp depende apenas do que o token autenticado pode acessar
 - os segredos ficam fora do Git em `.env`
+- o fluxo de cadastro no Bradial bloqueia telefones ambiguos no ClickUp e na Bradial
 
 ## Setup
 
@@ -39,10 +42,12 @@ Variaveis principais:
 - `BRADIAL_ACCOUNT_ID`
 - `BRADIAL_API_TOKEN`
 - `BRADIAL_INBOX_ID`
+- `BRADIAL_OPPORTUNITY_LABEL`
 - `CLICKUP_API_KEY`
 - `CLICKUP_WORKSPACE_NAME`
 - `CLICKUP_COMMERCIAL_SPACE_NAME`
 - `CLICKUP_COMMERCIAL_FOLDER_NAME`
+- `CLICKUP_WEBHOOK_SECRET`
 
 Opcionalmente, em vez de `CLICKUP_API_KEY`, o backend pode usar:
 
@@ -73,4 +78,7 @@ npm run dev
 - `GET /clickup/health`
 - `GET /clickup/navigation`
 - `GET /clickup/tasks`
+- `GET /clickup/pending-contacts`
+- `POST /clickup/tasks/:taskId/sync-to-bradial`
+- `POST /webhooks/clickup`
 - `POST /refresh`

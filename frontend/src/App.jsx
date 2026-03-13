@@ -73,6 +73,7 @@ function App() {
   const [config, setConfig] = usePersistentState('config', initialConfig)
   const [health, setHealth] = usePersistentState('health', initialHealth)
   const [leads, setLeads] = usePersistentState('leads', bootInLiveMode ? [] : initialLeads)
+  const [pendingContacts, setPendingContacts] = usePersistentState('pendingContacts', [])
   const [exceptions, setExceptions] = usePersistentState(
     'exceptions',
     bootInLiveMode ? [] : initialExceptions,
@@ -84,6 +85,7 @@ function App() {
   )
   const [leadSearch, setLeadSearch] = useState('')
   const [connectionState, setConnectionState] = useState('idle')
+  const [syncingTaskId, setSyncingTaskId] = useState(null)
 
   const deferredLeadSearch = useDeferredValue(leadSearch)
   const selectedLead =
@@ -93,6 +95,7 @@ function App() {
   const syncedToday = leads.filter((lead) => lead.syncEnabled).length
   const healthyLeads = leads.filter((lead) => lead.health === 'healthy').length
   const warningLeads = leads.filter((lead) => lead.health === 'warning').length
+  const actionablePendingContacts = pendingContacts.filter((item) => item.syncAllowed).length
 
   const filteredLeads = leads.filter((lead) => {
     const search = deferredLeadSearch.trim().toLowerCase()
@@ -122,10 +125,11 @@ function App() {
 
     setHealth(initialHealth)
     setLeads(initialLeads)
+    setPendingContacts([])
     setExceptions(initialExceptions)
     setLogs(initialLogs)
     setSelectedLeadId(initialLeads[0]?.id ?? null)
-  }, [config.mode, setExceptions, setHealth, setLeads, setLogs, setSelectedLeadId])
+  }, [config.mode, setExceptions, setHealth, setLeads, setLogs, setPendingContacts, setSelectedLeadId])
 
   const pushLog = useEffectEvent((entry) => {
     setLogs((current) => [entry, ...current].slice(0, 120))
@@ -261,32 +265,42 @@ function App() {
 
     try {
       const baseUrl = config.backendUrl.replace(/\/$/, '')
-      const [leadsResponse, exceptionsResponse, logsResponse] = await Promise.all([
+      const [leadsResponse, exceptionsResponse, logsResponse, pendingContactsResponse] = await Promise.all([
         fetch(`${baseUrl}/leads`),
         fetch(`${baseUrl}/exceptions`),
         fetch(`${baseUrl}/logs`),
+        fetch(`${baseUrl}/clickup/pending-contacts`),
       ])
 
-      if (!leadsResponse.ok || !exceptionsResponse.ok || !logsResponse.ok) {
+      if (
+        !leadsResponse.ok ||
+        !exceptionsResponse.ok ||
+        !logsResponse.ok ||
+        !pendingContactsResponse.ok
+      ) {
         throw new Error('Um dos endpoints respondeu com erro')
       }
 
-      const [nextLeads, nextExceptions, nextLogs] = await Promise.all([
+      const [nextLeads, nextExceptions, nextLogs, nextPendingContacts] = await Promise.all([
         leadsResponse.json(),
         exceptionsResponse.json(),
         logsResponse.json(),
+        pendingContactsResponse.json(),
       ])
 
       setLeads(Array.isArray(nextLeads) ? nextLeads : [])
       setExceptions(Array.isArray(nextExceptions) ? nextExceptions : [])
       setLogs(Array.isArray(nextLogs) ? nextLogs : [])
+      setPendingContacts(Array.isArray(nextPendingContacts) ? nextPendingContacts : [])
 
       if (!silent) {
         pushLog(
           createLog(
             'success',
             'Dados reais carregados',
-            `${Array.isArray(nextLeads) ? nextLeads.length : 0} leads importados do backend`,
+            `${Array.isArray(nextLeads) ? nextLeads.length : 0} leads e ${
+              Array.isArray(nextPendingContacts) ? nextPendingContacts.length : 0
+            } pendencias importados do backend`,
           ),
         )
       }
@@ -527,6 +541,58 @@ function App() {
     })
   }
 
+  const handleSyncPendingTask = async (pendingTask) => {
+    if (config.mode !== 'live' || !config.backendUrl.trim()) {
+      pushLog(
+        createLog(
+          'warning',
+          'Sync indisponivel',
+          'Use o modo live com backend configurado para criar contatos na Bradial.',
+        ),
+      )
+      return
+    }
+
+    setSyncingTaskId(pendingTask.taskId)
+
+    try {
+      const baseUrl = config.backendUrl.replace(/\/$/, '')
+      const response = await fetch(`${baseUrl}/clickup/tasks/${pendingTask.taskId}/sync-to-bradial`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ dryRun: false }),
+      })
+      const payload = await response.json().catch(() => ({}))
+
+      if (!response.ok) {
+        throw new Error(payload.error || `HTTP ${response.status}`)
+      }
+
+      await pingBackend(true)
+      pushLog(
+        createLog(
+          'success',
+          payload.operation === 'create' ? 'Contato criado no Bradial' : 'Contato atualizado no Bradial',
+          `${pendingTask.taskName} recebeu a label ${payload.opportunityLabel || 'OPORTUNIDADE'} sem envio de mensagem.`,
+          pendingTask.bradialLeadId,
+        ),
+      )
+    } catch (error) {
+      pushLog(
+        createLog(
+          'error',
+          'Falha ao sincronizar contato',
+          error.message || 'Nao foi possivel criar/atualizar o contato na Bradial.',
+          pendingTask.bradialLeadId,
+        ),
+      )
+    } finally {
+      setSyncingTaskId(null)
+    }
+  }
+
   const clearLogs = () => {
     setLogs([])
   }
@@ -543,8 +609,8 @@ function App() {
           <p className="eyebrow">Painel operacional</p>
           <h1>Bradial x ClickUp Sync Console</h1>
           <p className="hero-copy">
-            Controle a ingestao real da Bradial, acompanhe excecoes de identificacao
-            e prepare o vinculo com o ClickUp enquanto o token do CRM ainda nao foi conectado.
+            Controle a leitura real de Bradial e ClickUp, acompanhe excecoes de identificacao
+            e cadastre oportunidades no Bradial sem disparar mensagens automaticas.
           </p>
         </div>
 
@@ -577,6 +643,11 @@ function App() {
           <span className="stat-label">Excecoes abertas</span>
           <strong>{openExceptions.length}</strong>
           <small>{exceptions.length} registradas</small>
+        </article>
+        <article className="stat-card panel">
+          <span className="stat-label">Pendentes ClickUp</span>
+          <strong>{pendingContacts.length}</strong>
+          <small>{actionablePendingContacts} podem subir para o Bradial</small>
         </article>
         <article className="stat-card panel">
           <span className="stat-label">Logs em memoria</span>
@@ -700,6 +771,8 @@ function App() {
               <code>GET /logs</code>
               <code>GET /clickup/health</code>
               <code>GET /clickup/tasks</code>
+              <code>GET /clickup/pending-contacts</code>
+              <code>POST /clickup/tasks/:taskId/sync-to-bradial</code>
               <code>POST /refresh</code>
             </div>
           </section>
@@ -753,6 +826,76 @@ function App() {
         </aside>
 
         <main className="column-stack main-column">
+          <section className="panel section-card">
+            <div className="section-heading">
+              <div>
+                <p className="eyebrow">ClickUp</p>
+                <h2>Oportunidades para Bradial</h2>
+              </div>
+              <span className={`pill ${pendingContacts.length ? 'pill-warning' : 'pill-success'}`}>
+                {pendingContacts.length} pendentes
+              </span>
+            </div>
+
+            <div className="opportunity-list">
+              {config.mode !== 'live' ? (
+                <div className="empty-state">
+                  <strong>Disponivel apenas no modo live</strong>
+                  <p>Essa fila mostra tasks reais do ClickUp que ainda precisam virar contato no Bradial.</p>
+                </div>
+              ) : pendingContacts.length === 0 ? (
+                <div className="empty-state">
+                  <strong>Nenhuma oportunidade pendente</strong>
+                  <p>Todas as tasks elegiveis ja possuem contato Bradial com a label OPORTUNIDADE.</p>
+                </div>
+              ) : (
+                pendingContacts.map((item) => (
+                  <article key={item.id} className="opportunity-card">
+                    <div className="exception-meta">
+                      <span className={`pill ${item.syncAllowed ? 'pill-warning' : 'pill-risk'}`}>
+                        {item.syncState}
+                      </span>
+                      <span>{formatDate(item.dateUpdated)}</span>
+                    </div>
+                    <strong>{item.taskName}</strong>
+                    <p>{item.summary}</p>
+                    <div className="opportunity-meta">
+                      <span>{item.phone}</span>
+                      <span>{item.status}</span>
+                      <span>{item.owner || 'sem owner'}</span>
+                      <span>{item.listName}</span>
+                    </div>
+                    <div className="opportunity-actions">
+                      <span>
+                        {item.bradialContactId
+                          ? `Contato Bradial ${item.bradialContactId}`
+                          : 'Contato ainda nao existe na Bradial'}
+                      </span>
+                      <div className="detail-actions">
+                        {item.url ? (
+                          <a className="inline-link" href={item.url} target="_blank" rel="noreferrer">
+                            Abrir task
+                          </a>
+                        ) : null}
+                        <button
+                          type="button"
+                          disabled={!item.syncAllowed || syncingTaskId === item.taskId}
+                          onClick={() => void handleSyncPendingTask(item)}
+                        >
+                          {syncingTaskId === item.taskId
+                            ? 'Processando...'
+                            : item.syncState === 'missing_contact'
+                              ? 'Criar contato'
+                              : 'Atualizar contato'}
+                        </button>
+                      </div>
+                    </div>
+                  </article>
+                ))
+              )}
+            </div>
+          </section>
+
           <section className="panel section-card">
             <div className="section-heading">
               <div>

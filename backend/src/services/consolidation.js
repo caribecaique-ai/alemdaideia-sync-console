@@ -75,6 +75,15 @@ function pickBestTask(tasks) {
   })[0]
 }
 
+function hasOpportunityLabel(lead, opportunityLabel) {
+  const target = String(opportunityLabel || '').trim().toLowerCase()
+  if (!target) return false
+
+  return (lead?.bradialLabels || lead?.raw?.bradialLabels || []).some(
+    (label) => String(label || '').trim().toLowerCase() === target,
+  )
+}
+
 function enrichLead(lead, matchingTasks, clickupSnapshot) {
   const bestTask = matchingTasks.length ? pickBestTask(matchingTasks) : null
   const tags = new Set(Array.isArray(lead.tags) ? lead.tags : [])
@@ -120,6 +129,9 @@ function buildOverview({ leads, exceptions, agents, inboxes, clickupSnapshot, ac
     inboxesCount: inboxes.length,
     clickupTaskCount: Array.isArray(clickupSnapshot?.tasks) ? clickupSnapshot.tasks.length : 0,
     clickupMatchedCount: leads.filter((lead) => lead.clickupTaskId).length,
+    clickupPendingContactCount: Array.isArray(clickupSnapshot?.pendingContacts)
+      ? clickupSnapshot.pendingContacts.length
+      : 0,
     accountId,
     preferredInboxId,
     clickupWorkspaceId: clickupSnapshot?.workspace?.id || null,
@@ -137,8 +149,83 @@ function buildClickupHealth(clickupSnapshot) {
     workspaceName: clickupSnapshot?.workspace?.name || null,
     taskCount: Array.isArray(clickupSnapshot?.tasks) ? clickupSnapshot.tasks.length : 0,
     listCount: Array.isArray(clickupSnapshot?.navigation?.lists) ? clickupSnapshot.navigation.lists.length : 0,
+    pendingContactCount: Array.isArray(clickupSnapshot?.pendingContacts)
+      ? clickupSnapshot.pendingContacts.length
+      : 0,
     lastError: clickupSnapshot?.error || null,
   }
+}
+
+function buildPendingClickupContacts(taskIndex, leads, clickupSnapshot, opportunityLabel) {
+  const bradialIndex = new Map()
+
+  for (const lead of leads) {
+    const phone = normalizePhone(lead.phone)
+    if (!phone) continue
+    if (!bradialIndex.has(phone)) bradialIndex.set(phone, [])
+    bradialIndex.get(phone).push(lead)
+  }
+
+  return (clickupSnapshot?.tasks || [])
+    .filter((task) => {
+      if (!normalizePhone(task.phone)) return false
+      const statusType = String(task.statusType || '').toLowerCase()
+      return statusType !== 'done' && statusType !== 'closed'
+    })
+    .map((task) => {
+      const phone = normalizePhone(task.phone)
+      const clickupMatches = phone ? taskIndex.get(phone) || [] : []
+      const bradialMatches = phone ? bradialIndex.get(phone) || [] : []
+      const matchedLead = bradialMatches[0] || null
+      const alreadyTagged = matchedLead ? hasOpportunityLabel(matchedLead, opportunityLabel) : false
+
+      let syncState = null
+      let syncAllowed = false
+      let summary = ''
+
+      if (clickupMatches.length > 1) {
+        syncState = 'ambiguous_clickup_phone'
+        summary = `Telefone usado em ${clickupMatches.length} tasks do ClickUp.`
+      } else if (bradialMatches.length > 1) {
+        syncState = 'ambiguous_bradial_phone'
+        summary = `Telefone usado em ${bradialMatches.length} contatos da Bradial.`
+      } else if (!matchedLead) {
+        syncState = 'missing_contact'
+        syncAllowed = true
+        summary = 'Task pronta para criar um novo contato no Bradial.'
+      } else if (!alreadyTagged) {
+        syncState = 'missing_opportunity_label'
+        syncAllowed = true
+        summary = `Contato encontrado no Bradial, mas ainda sem a label ${opportunityLabel}.`
+      }
+
+      if (!syncState) return null
+
+      return {
+        id: `pending-clickup-${task.id}`,
+        taskId: task.id,
+        taskName: task.name,
+        phone,
+        email: task.email || null,
+        owner: task.owner || null,
+        status: task.status,
+        statusType: task.statusType,
+        listName: task.listName,
+        url: task.url || null,
+        dateUpdated: task.dateUpdated || null,
+        bradialLeadId: matchedLead?.id || null,
+        bradialContactId: matchedLead?.chatContactId || null,
+        bradialContactName: matchedLead?.name || null,
+        bradialLabels: matchedLead?.bradialLabels || matchedLead?.raw?.bradialLabels || [],
+        bradialMatchCount: bradialMatches.length,
+        clickupMatchCount: clickupMatches.length,
+        syncState,
+        syncAllowed,
+        summary,
+      }
+    })
+    .filter(Boolean)
+    .sort((left, right) => Number(right.dateUpdated || 0) - Number(left.dateUpdated || 0))
 }
 
 export function buildConsolidatedSnapshot({
@@ -147,6 +234,7 @@ export function buildConsolidatedSnapshot({
   accountId,
   preferredInboxId,
   lastRefreshAt,
+  opportunityLabel,
 }) {
   const taskIndex = new Map()
   const snapshotAt = lastRefreshAt || new Date().toISOString()
@@ -164,6 +252,13 @@ export function buildConsolidatedSnapshot({
     return enrichLead(lead, matchingTasks, clickupSnapshot)
   })
 
+  const pendingContacts = buildPendingClickupContacts(
+    taskIndex,
+    leads,
+    clickupSnapshot,
+    opportunityLabel,
+  )
+
   const exceptions = [
     ...buildBradialExceptions(bradialSnapshot?.leads || [], snapshotAt),
     ...buildClickupExceptions(taskIndex, snapshotAt),
@@ -175,7 +270,10 @@ export function buildConsolidatedSnapshot({
       exceptions,
       agents: bradialSnapshot?.agents || [],
       inboxes: bradialSnapshot?.inboxes || [],
-      clickupSnapshot,
+      clickupSnapshot: {
+        ...clickupSnapshot,
+        pendingContacts,
+      },
       accountId,
       preferredInboxId,
       lastRefreshAt: snapshotAt,
@@ -185,10 +283,14 @@ export function buildConsolidatedSnapshot({
     agents: bradialSnapshot?.agents || [],
     inboxes: bradialSnapshot?.inboxes || [],
     clickup: {
-      health: buildClickupHealth(clickupSnapshot),
+      health: buildClickupHealth({
+        ...clickupSnapshot,
+        pendingContacts,
+      }),
       workspaces: clickupSnapshot?.workspaces || [],
       navigation: clickupSnapshot?.navigation || null,
       tasks: clickupSnapshot?.tasks || [],
+      pendingContacts,
     },
   }
 }

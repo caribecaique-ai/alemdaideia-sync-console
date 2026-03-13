@@ -1,6 +1,10 @@
 import fs from 'node:fs'
 import { normalizePhone, normalizeText, phoneFieldLooksRelevant } from '../utils/normalizers.js'
 
+function normalizeScopeName(value) {
+  return normalizeText(value).replace(/^\d+\s*[\.\-\)]\s*/, '')
+}
+
 function resolveFieldValue(field) {
   if (!field) return null
   if (field.type === 'drop_down') {
@@ -24,9 +28,9 @@ export function createClickupAdapter(config, pushLog) {
   const explicitApiKey = String(config.apiKey || '').trim()
   const workspaceName = normalizeText(config.workspaceName || 'alem da ideia')
   const workspaceId = String(config.workspaceId || '').trim()
-  const commercialSpaceName = normalizeText(config.commercialSpaceName || 'comercial')
-  const commercialFolderName = normalizeText(config.commercialFolderName || 'area de vendas')
-  const commercialListName = normalizeText(config.commercialListName || '')
+  const commercialSpaceName = normalizeScopeName(config.commercialSpaceName || 'comercial')
+  const commercialFolderName = normalizeScopeName(config.commercialFolderName || 'area de vendas')
+  const commercialListName = normalizeScopeName(config.commercialListName || '')
   const maxListPages = Math.max(1, Number(config.maxListPages || 4))
   const backupClientName = normalizeText(config.backupClientName || 'Stev')
   const backupPath = String(config.clientsBackupPath || '').trim()
@@ -100,6 +104,16 @@ export function createClickupAdapter(config, pushLog) {
     )
   }
 
+  function matchByScopeName(items, targetName) {
+    if (!targetName) return null
+
+    return (
+      items.find((item) => normalizeScopeName(item.name) === targetName) ||
+      items.find((item) => normalizeScopeName(item.name).includes(targetName)) ||
+      null
+    )
+  }
+
   async function resolveWorkspaceContext(force = false) {
     if (resolvedContext && !force) return resolvedContext
 
@@ -157,7 +171,7 @@ export function createClickupAdapter(config, pushLog) {
       archived: false,
     })
     const spaces = Array.isArray(spacesPayload?.spaces) ? spacesPayload.spaces : []
-    const targetSpace = spaces.find((space) => normalizeText(space.name) === commercialSpaceName)
+    const targetSpace = matchByScopeName(spaces, commercialSpaceName)
     if (!targetSpace) {
       throw new Error(`Space comercial nao encontrado no workspace ${context.workspace.name}.`)
     }
@@ -166,7 +180,7 @@ export function createClickupAdapter(config, pushLog) {
       archived: false,
     })
     const folders = Array.isArray(foldersPayload?.folders) ? foldersPayload.folders : []
-    const targetFolder = folders.find((folder) => normalizeText(folder.name) === commercialFolderName)
+    const targetFolder = matchByScopeName(folders, commercialFolderName)
     if (!targetFolder) {
       throw new Error(`Pasta comercial nao encontrada no space ${targetSpace.name}.`)
     }
@@ -176,7 +190,7 @@ export function createClickupAdapter(config, pushLog) {
     })
     const lists = Array.isArray(listsPayload?.lists) ? listsPayload.lists : []
     const selectedLists = commercialListName
-      ? lists.filter((list) => normalizeText(list.name) === commercialListName)
+      ? lists.filter((list) => normalizeScopeName(list.name) === commercialListName)
       : lists
 
     if (!selectedLists.length) {
