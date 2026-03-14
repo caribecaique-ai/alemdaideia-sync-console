@@ -3,6 +3,7 @@ import {
   useDeferredValue,
   useEffect,
   useEffectEvent,
+  useRef,
   useState,
 } from 'react'
 import './App.css'
@@ -15,7 +16,7 @@ import {
   mockEventCatalog,
 } from './mockState'
 
-const STORAGE_NAMESPACE = 'bradial-clickup-sync-ui-v2'
+const STORAGE_NAMESPACE = 'bradial-clickup-sync-ui-v3'
 
 function readStorage(key, fallback) {
   const fullKey = `${STORAGE_NAMESPACE}:${key}`
@@ -68,11 +69,172 @@ function createLog(level, title, message, leadId = null) {
   }
 }
 
+function normalizeLeadPhone(value) {
+  const digits = String(value || '').replace(/\D/g, '')
+  if (!digits) return null
+  if (/^55\d{2}9\d{8}$/.test(digits)) return `${digits.slice(0, 4)}${digits.slice(5)}`
+  if (/^55\d{2}\d{8}$/.test(digits)) return digits
+  return digits
+}
+
+function leadHealthRank(value) {
+  if (value === 'risk') return 3
+  if (value === 'warning') return 2
+  if (value === 'healthy') return 1
+  return 0
+}
+
+function toLeadTimestamp(value) {
+  if (!value) return 0
+  const parsed = Date.parse(value)
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+function leadScore(lead) {
+  return (
+    (lead?.clickupTaskId ? 200 : 0) +
+    (lead?.chatConversationId || lead?.conversationId ? 80 : 0) +
+    (lead?.raw?.bradialContactId || lead?.chatContactId ? 60 : 0) +
+    ((lead?.bradialLabels || lead?.raw?.bradialLabels || []).length ? 30 : 0) +
+    (lead?.clickupStage ? 20 : 0) +
+    (lead?.syncEnabled ? 10 : 0) +
+    toLeadTimestamp(lead?.lastSyncAt)
+  )
+}
+
+function chooseLeadValue(leads, selector, fallback = null) {
+  for (const lead of leads) {
+    const value = selector(lead)
+    if (value === undefined || value === null) continue
+    if (typeof value === 'string' && !value.trim()) continue
+    if (Array.isArray(value) && !value.length) continue
+    return value
+  }
+
+  return fallback
+}
+
+function getLeadKeys(lead) {
+  const keys = new Set()
+  const phone = normalizeLeadPhone(lead.phone)
+  const clickupTaskId = String(lead?.clickupTaskId || '').trim() || null
+  const bradialContactId =
+    String(lead?.raw?.bradialContactId || lead?.chatContactId || '').trim() || null
+  const chatConversationId =
+    String(lead?.chatConversationId || lead?.conversationId || '').trim() || null
+
+  if (clickupTaskId) keys.add(`task:${clickupTaskId}`)
+  if (phone) keys.add(`phone:${phone}`)
+  if (bradialContactId) keys.add(`contact:${bradialContactId}`)
+  if (chatConversationId) keys.add(`conversation:${chatConversationId}`)
+  if (!keys.size) keys.add(`lead:${lead.id}`)
+
+  return [...keys]
+}
+
+function chooseCanonicalLeadId(leads, preferredLead) {
+  const clickupTaskId = chooseLeadValue(leads, (lead) => lead.clickupTaskId)
+  if (clickupTaskId) return `lead-task-${clickupTaskId}`
+
+  const phone = normalizeLeadPhone(chooseLeadValue(leads, (lead) => lead.phone))
+  if (phone) return `lead-phone-${phone}`
+
+  const bradialContactId = chooseLeadValue(
+    leads,
+    (lead) => lead?.raw?.bradialContactId || lead?.chatContactId,
+  )
+  if (bradialContactId) return `lead-contact-${bradialContactId}`
+
+  return preferredLead.id
+}
+
+function mergeLeadGroup(group) {
+  const sorted = [...group].sort((left, right) => leadScore(right) - leadScore(left))
+  const preferredLead = sorted[0]
+  const canonicalId = chooseCanonicalLeadId(sorted, preferredLead)
+  const labels =
+    chooseLeadValue(sorted, (lead) => lead.bradialLabels) ||
+    chooseLeadValue(sorted, (lead) => lead?.raw?.bradialLabels, [])
+
+  return {
+    ...preferredLead,
+    id: canonicalId,
+    name: chooseLeadValue(sorted, (lead) => lead.name, preferredLead.name),
+    phone: chooseLeadValue(sorted, (lead) => lead.phone, preferredLead.phone),
+    email: chooseLeadValue(sorted, (lead) => lead.email, preferredLead.email),
+    clickupTaskId: chooseLeadValue(sorted, (lead) => lead.clickupTaskId),
+    clickupStage: chooseLeadValue(sorted, (lead) => lead.clickupStage),
+    clickupTaskUrl: chooseLeadValue(sorted, (lead) => lead.clickupTaskUrl),
+    clickupWorkspace: chooseLeadValue(sorted, (lead) => lead.clickupWorkspace),
+    clickupListName: chooseLeadValue(sorted, (lead) => lead.clickupListName),
+    clickupPhoneMatched: chooseLeadValue(sorted, (lead) => lead.clickupPhoneMatched),
+    conversationId: chooseLeadValue(sorted, (lead) => lead.conversationId),
+    chatConversationId: chooseLeadValue(sorted, (lead) => lead.chatConversationId),
+    chatContactId: chooseLeadValue(sorted, (lead) => lead.chatContactId),
+    owner: chooseLeadValue(sorted, (lead) => lead.owner, preferredLead.owner),
+    chatStatus: chooseLeadValue(sorted, (lead) => lead.chatStatus, preferredLead.chatStatus),
+    syncEnabled: sorted.some((lead) => lead.syncEnabled !== false),
+    health:
+      [...sorted].sort((left, right) => leadHealthRank(right.health) - leadHealthRank(left.health))[0]
+        ?.health || preferredLead.health,
+    bradialLabels: labels,
+    tags: [...new Set(chooseLeadValue(sorted, (lead) => lead.tags, preferredLead.tags || []))],
+    summary: chooseLeadValue(sorted, (lead) => lead.summary, preferredLead.summary),
+    lastAction: chooseLeadValue(sorted, (lead) => lead.lastAction, preferredLead.lastAction),
+    lastSyncAt: chooseLeadValue(sorted, (lead) => lead.lastSyncAt, preferredLead.lastSyncAt),
+    matchCount: Math.max(...sorted.map((lead) => Number(lead.matchCount || 0)), 0),
+    raw: {
+      ...(preferredLead.raw || {}),
+      bradialContactId: chooseLeadValue(
+        sorted,
+        (lead) => lead?.raw?.bradialContactId || lead?.chatContactId,
+      ),
+      bradialLabels: labels,
+      bradialEmail: chooseLeadValue(sorted, (lead) => lead?.raw?.bradialEmail || lead?.email),
+      clickupTaskId: chooseLeadValue(sorted, (lead) => lead?.raw?.clickupTaskId || lead?.clickupTaskId),
+      mergedLeadIds: sorted.map((lead) => lead.id),
+    },
+  }
+}
+
+function dedupeLeads(items) {
+  const leads = Array.isArray(items) ? items.filter(Boolean) : []
+  const groups = []
+
+  for (const lead of leads) {
+    const keys = getLeadKeys(lead)
+    const matches = groups.filter((group) => keys.some((key) => group.keys.has(key)))
+
+    if (!matches.length) {
+      groups.push({
+        keys: new Set(keys),
+        leads: [lead],
+      })
+      continue
+    }
+
+    const primaryGroup = matches[0]
+    primaryGroup.leads.push(lead)
+    keys.forEach((key) => primaryGroup.keys.add(key))
+
+    for (const duplicateGroup of matches.slice(1)) {
+      duplicateGroup.leads.forEach((item) => primaryGroup.leads.push(item))
+      duplicateGroup.keys.forEach((key) => primaryGroup.keys.add(key))
+      groups.splice(groups.indexOf(duplicateGroup), 1)
+    }
+  }
+
+  return groups.map((group) => mergeLeadGroup(group.leads))
+}
+
 function App() {
   const bootInLiveMode = initialConfig.mode === 'live'
   const [config, setConfig] = usePersistentState('config', initialConfig)
   const [health, setHealth] = usePersistentState('health', initialHealth)
-  const [leads, setLeads] = usePersistentState('leads', bootInLiveMode ? [] : initialLeads)
+  const [leads, setLeads] = usePersistentState(
+    'leads',
+    bootInLiveMode ? [] : dedupeLeads(initialLeads),
+  )
   const [pendingContacts, setPendingContacts] = usePersistentState('pendingContacts', [])
   const [webhookRegistry, setWebhookRegistry] = usePersistentState('webhookRegistry', {
     publicBaseUrl: '',
@@ -93,18 +255,21 @@ function App() {
   const [connectionState, setConnectionState] = useState('idle')
   const [syncingTaskId, setSyncingTaskId] = useState(null)
   const [creatingWebhookUrl, setCreatingWebhookUrl] = useState(false)
+  const [liveSessionHydrated, setLiveSessionHydrated] = useState(false)
+  const livePullTimeoutRef = useRef(null)
 
   const deferredLeadSearch = useDeferredValue(leadSearch)
+  const unifiedLeads = dedupeLeads(leads)
   const selectedLead =
-    leads.find((lead) => lead.id === selectedLeadId) ?? leads[0] ?? null
+    unifiedLeads.find((lead) => lead.id === selectedLeadId) ?? unifiedLeads[0] ?? null
 
   const openExceptions = exceptions.filter((item) => item.status !== 'resolved')
-  const syncedToday = leads.filter((lead) => lead.syncEnabled).length
-  const healthyLeads = leads.filter((lead) => lead.health === 'healthy').length
-  const warningLeads = leads.filter((lead) => lead.health === 'warning').length
+  const syncedToday = unifiedLeads.filter((lead) => lead.syncEnabled).length
+  const healthyLeads = unifiedLeads.filter((lead) => lead.health === 'healthy').length
+  const warningLeads = unifiedLeads.filter((lead) => lead.health === 'warning').length
   const actionablePendingContacts = pendingContacts.filter((item) => item.syncAllowed).length
 
-  const filteredLeads = leads.filter((lead) => {
+  const filteredLeads = unifiedLeads.filter((lead) => {
     const search = deferredLeadSearch.trim().toLowerCase()
     if (!search) return true
 
@@ -121,17 +286,41 @@ function App() {
   })
 
   useEffect(() => {
-    if (selectedLeadId) return
-    if (!leads[0]) return
+    if (selectedLeadId && unifiedLeads.some((lead) => lead.id === selectedLeadId)) return
+    if (!unifiedLeads[0]) return
 
-    setSelectedLeadId(leads[0].id)
-  }, [leads, selectedLeadId, setSelectedLeadId])
+    setSelectedLeadId(unifiedLeads[0].id)
+  }, [selectedLeadId, setSelectedLeadId, unifiedLeads])
+
+  useEffect(() => {
+    setLeads((current) => dedupeLeads(current))
+  }, [setLeads])
+
+  useEffect(() => {
+    if (config.mode !== 'live') {
+      setLiveSessionHydrated(false)
+      return
+    }
+
+    if (liveSessionHydrated) return
+
+    setLeads([])
+    setPendingContacts([])
+    setSelectedLeadId(null)
+    setLiveSessionHydrated(true)
+  }, [
+    config.mode,
+    liveSessionHydrated,
+    setLeads,
+    setPendingContacts,
+    setSelectedLeadId,
+  ])
 
   useEffect(() => {
     if (config.mode !== 'mock') return
 
     setHealth(initialHealth)
-    setLeads(initialLeads)
+    setLeads(dedupeLeads(initialLeads))
     setPendingContacts([])
     setWebhookRegistry({
       publicBaseUrl: '',
@@ -141,16 +330,29 @@ function App() {
     })
     setExceptions(initialExceptions)
     setLogs(initialLogs)
-    setSelectedLeadId(initialLeads[0]?.id ?? null)
+    setSelectedLeadId(dedupeLeads(initialLeads)[0]?.id ?? null)
   }, [config.mode, setExceptions, setHealth, setLeads, setLogs, setPendingContacts, setSelectedLeadId, setWebhookRegistry])
 
   const pushLog = useEffectEvent((entry) => {
     setLogs((current) => [entry, ...current].slice(0, 120))
   })
 
+  const scheduleLivePull = useEffectEvent((reason = 'sse') => {
+    if (config.mode !== 'live' || !config.backendUrl.trim()) return
+
+    if (livePullTimeoutRef.current) {
+      window.clearTimeout(livePullTimeoutRef.current)
+    }
+
+    livePullTimeoutRef.current = window.setTimeout(() => {
+      livePullTimeoutRef.current = null
+      void pullLiveData(true)
+    }, reason === 'snapshot' ? 150 : 700)
+  })
+
   const runMockTick = useEffectEvent(() => {
     const event = mockEventCatalog[Math.floor(Math.random() * mockEventCatalog.length)]
-    const candidateLead = leads[Math.floor(Math.random() * leads.length)]
+    const candidateLead = unifiedLeads[Math.floor(Math.random() * unifiedLeads.length)]
 
     if (!event || !candidateLead) return
 
@@ -223,6 +425,47 @@ function App() {
 
     return () => window.clearInterval(intervalId)
   }, [config.mode, runMockTick])
+
+  useEffect(() => {
+    if (config.mode !== 'live' || !config.backendUrl.trim()) return undefined
+
+    const eventSource = new EventSource(`${config.backendUrl.replace(/\/$/, '')}/events`)
+
+    const handleSnapshot = () => {
+      scheduleLivePull('snapshot')
+    }
+
+    const handleSyncAudit = (event) => {
+      try {
+        const payload = JSON.parse(event.data || '{}')
+        if (
+          [
+            'sync_enqueued',
+            'sync_started',
+            'sync_succeeded',
+            'sync_skipped',
+            'sync_failed',
+            'sync_failed_retrying',
+          ].includes(payload?.type)
+        ) {
+          scheduleLivePull('sync')
+        }
+      } catch {}
+    }
+
+    eventSource.addEventListener('snapshot_refreshed', handleSnapshot)
+    eventSource.addEventListener('sync_audit', handleSyncAudit)
+
+    return () => {
+      eventSource.removeEventListener('snapshot_refreshed', handleSnapshot)
+      eventSource.removeEventListener('sync_audit', handleSyncAudit)
+      eventSource.close()
+      if (livePullTimeoutRef.current) {
+        window.clearTimeout(livePullTimeoutRef.current)
+        livePullTimeoutRef.current = null
+      }
+    }
+  }, [config.backendUrl, config.mode, scheduleLivePull])
 
   const saveConfig = () => {
     pushLog(
@@ -316,7 +559,7 @@ function App() {
         webhookIntegrationsResponse.json(),
       ])
 
-      setLeads(Array.isArray(nextLeads) ? nextLeads : [])
+      setLeads(dedupeLeads(Array.isArray(nextLeads) ? nextLeads : []))
       setExceptions(Array.isArray(nextExceptions) ? nextExceptions : [])
       setLogs(Array.isArray(nextLogs) ? nextLogs : [])
       setPendingContacts(Array.isArray(nextPendingContacts) ? nextPendingContacts : [])
@@ -436,7 +679,7 @@ function App() {
 
     const intervalId = window.setInterval(() => {
       void pingBackend(true)
-    }, 30000)
+    }, 10000)
 
     return () => window.clearInterval(intervalId)
   }, [config.autoPoll, config.backendUrl, config.mode])
@@ -613,7 +856,7 @@ function App() {
         createLog(
           'success',
           payload.operation === 'create' ? 'Contato criado no Bradial' : 'Contato atualizado no Bradial',
-          `${pendingTask.taskName} recebeu a label ${payload.opportunityLabel || 'OPORTUNIDADE'} sem envio de mensagem.`,
+          `${pendingTask.taskName} recebeu a tag ${payload.stageLabel || pendingTask.targetStageLabel || 'de etapa'} sem envio de mensagem.`,
           pendingTask.bradialLeadId,
         ),
       )
@@ -985,7 +1228,7 @@ function App() {
               ) : pendingContacts.length === 0 ? (
                 <div className="empty-state">
                   <strong>Nenhuma oportunidade pendente</strong>
-                  <p>Todas as tasks elegiveis ja possuem contato Bradial com a label OPORTUNIDADE.</p>
+                  <p>Todas as tasks elegiveis ja possuem contato Bradial com a tag de etapa alinhada ao status atual do ClickUp.</p>
                 </div>
               ) : (
                 pendingContacts.map((item) => (

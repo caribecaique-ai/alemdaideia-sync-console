@@ -35,6 +35,7 @@ export function createClickupAdapter(config, pushLog) {
   const backupClientName = normalizeText(config.backupClientName || 'Stev')
   const backupPath = String(config.clientsBackupPath || '').trim()
   let resolvedContext = null
+  let resolvedNavigation = null
 
   function readBackupCandidates() {
     if (!backupPath || !fs.existsSync(backupPath)) return []
@@ -214,6 +215,52 @@ export function createClickupAdapter(config, pushLog) {
     }
   }
 
+  async function resolveCommercialNavigation(context, force = false) {
+    if (resolvedNavigation && !force) return resolvedNavigation
+    resolvedNavigation = await fetchCommercialNavigation(context)
+    return resolvedNavigation
+  }
+
+  function mapTask(task, navigationList = null, navigation = null) {
+    const customFields = Array.isArray(task.custom_fields)
+      ? task.custom_fields.map((field) => ({
+          id: String(field.id),
+          name: String(field.name || '').trim(),
+          type: field.type,
+          value: resolveFieldValue(field),
+        }))
+      : []
+
+    const phoneField = customFields.find((field) => phoneFieldLooksRelevant(field.name))
+    const emailField = customFields.find((field) => normalizeText(field.name) === 'e-mail')
+    const assignees = Array.isArray(task.assignees)
+      ? task.assignees.map((assignee) => String(assignee.username || assignee.email || '').trim()).filter(Boolean)
+      : []
+
+    return {
+      id: String(task.id),
+      name: String(task.name || '').trim(),
+      phone: normalizePhone(phoneField?.value),
+      email: emailField?.value ? String(emailField.value).trim() : null,
+      status: String(task.status?.status || 'sem status').trim(),
+      statusType: String(task.status?.type || 'unknown').trim(),
+      owner: assignees[0] || null,
+      assignees,
+      listId: String(navigationList?.id || task.list?.id || task.list_id || ''),
+      listName: String(navigationList?.name || task.list?.name || '').trim(),
+      folderId: String(navigation?.folder?.id || task.folder?.id || task.folder_id || ''),
+      folderName: String(navigation?.folder?.name || task.folder?.name || '').trim(),
+      spaceId: String(navigation?.space?.id || task.space?.id || task.space_id || ''),
+      spaceName: String(navigation?.space?.name || task.space?.name || '').trim(),
+      tags: Array.isArray(task.tags)
+        ? task.tags.map((tag) => String(tag.name || '').trim()).filter(Boolean)
+        : [],
+      customFields,
+      url: String(task.url || '').trim() || null,
+      dateUpdated: task.date_updated || task.date_updated_local || null,
+    }
+  }
+
   async function fetchTasksForList(context, navigationList, navigation) {
     const rows = []
 
@@ -229,51 +276,36 @@ export function createClickupAdapter(config, pushLog) {
       if (tasks.length < 100) break
     }
 
-    return rows.map((task) => {
-      const customFields = Array.isArray(task.custom_fields)
-        ? task.custom_fields.map((field) => ({
-            id: String(field.id),
-            name: String(field.name || '').trim(),
-            type: field.type,
-            value: resolveFieldValue(field),
-          }))
-        : []
+    return rows.map((task) => mapTask(task, navigationList, navigation))
+  }
 
-      const phoneField = customFields.find((field) => phoneFieldLooksRelevant(field.name))
-      const emailField = customFields.find((field) => normalizeText(field.name) === 'e-mail')
-      const assignees = Array.isArray(task.assignees)
-        ? task.assignees.map((assignee) => String(assignee.username || assignee.email || '').trim()).filter(Boolean)
-        : []
+  async function fetchTaskById(taskId, trigger = 'manual-task') {
+    const normalizedTaskId = String(taskId || '').trim()
+    if (!normalizedTaskId) return null
 
-      return {
-        id: String(task.id),
-        name: String(task.name || '').trim(),
-        phone: normalizePhone(phoneField?.value),
-        email: emailField?.value ? String(emailField.value).trim() : null,
-        status: String(task.status?.status || 'sem status').trim(),
-        statusType: String(task.status?.type || 'unknown').trim(),
-        owner: assignees[0] || null,
-        assignees,
-        listId: navigationList.id,
-        listName: navigationList.name,
-        folderId: navigation.folder.id,
-        folderName: navigation.folder.name,
-        spaceId: navigation.space.id,
-        spaceName: navigation.space.name,
-        tags: Array.isArray(task.tags)
-          ? task.tags.map((tag) => String(tag.name || '').trim()).filter(Boolean)
-          : [],
-        customFields,
-        url: String(task.url || '').trim() || null,
-        dateUpdated: task.date_updated || task.date_updated_local || null,
-      }
-    })
+    const context = await resolveWorkspaceContext()
+    const navigation = await resolveCommercialNavigation(context)
+    const task = await request(`/task/${normalizedTaskId}`, context.token)
+    const navigationList =
+      navigation.lists.find((list) => String(list.id) === String(task?.list?.id || task?.list_id || '')) || null
+
+    if (!navigationList) {
+      pushLog(
+        'info',
+        'Task ClickUp fora do escopo',
+        `Task ${normalizedTaskId} ignorada porque nao pertence as listas monitoradas.`,
+        { trigger },
+      )
+      return null
+    }
+
+    return mapTask(task, navigationList, navigation)
   }
 
   async function fetchSnapshot(trigger = 'manual') {
     const snapshotAt = new Date().toISOString()
     const context = await resolveWorkspaceContext()
-    const navigation = await fetchCommercialNavigation(context)
+    const navigation = await resolveCommercialNavigation(context)
     const taskGroups = await Promise.all(
       navigation.lists.map((list) => fetchTasksForList(context, list, navigation)),
     )
@@ -307,5 +339,6 @@ export function createClickupAdapter(config, pushLog) {
 
   return {
     fetchSnapshot,
+    fetchTaskById,
   }
 }

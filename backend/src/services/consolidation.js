@@ -1,12 +1,18 @@
-import { normalizePhone } from '../utils/normalizers.js'
+import { normalizePhone, normalizePhoneLooseKey } from '../utils/normalizers.js'
+import {
+  labelsIncludeEquivalent,
+  pickControlledLabels,
+  resolveBradialStageLabel,
+} from './clickupStageLabels.js'
 
 function buildBradialExceptions(leads, snapshotAt) {
   const groupedByPhone = new Map()
   const exceptions = []
 
   for (const lead of leads) {
-    if (!groupedByPhone.has(lead.phone)) groupedByPhone.set(lead.phone, [])
-    groupedByPhone.get(lead.phone).push(lead)
+    const phoneKey = normalizeLeadPhone(lead.phone) || lead.phone
+    if (!groupedByPhone.has(phoneKey)) groupedByPhone.set(phoneKey, [])
+    groupedByPhone.get(phoneKey).push(lead)
 
     if (lead.phone === 'sem telefone') {
       exceptions.push({
@@ -75,13 +81,161 @@ function pickBestTask(tasks) {
   })[0]
 }
 
-function hasOpportunityLabel(lead, opportunityLabel) {
-  const target = String(opportunityLabel || '').trim().toLowerCase()
-  if (!target) return false
+function hasStageLabel(lead, targetLabel) {
+  if (!targetLabel) return false
+  return labelsIncludeEquivalent(lead?.bradialLabels || lead?.raw?.bradialLabels || [], targetLabel)
+}
 
-  return (lead?.bradialLabels || lead?.raw?.bradialLabels || []).some(
-    (label) => String(label || '').trim().toLowerCase() === target,
+function normalizeLeadPhone(value) {
+  return normalizePhoneLooseKey(value) || normalizePhone(value) || null
+}
+
+function toTimestamp(value) {
+  if (!value) return 0
+  const parsed = Date.parse(value)
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+function healthRank(value) {
+  if (value === 'risk') return 3
+  if (value === 'warning') return 2
+  if (value === 'healthy') return 1
+  return 0
+}
+
+function getLeadKeys(lead) {
+  const keys = new Set()
+  const phone = normalizeLeadPhone(lead.phone)
+  const bradialContactId =
+    String(lead?.raw?.bradialContactId || lead?.chatContactId || '').trim() || null
+  const chatConversationId =
+    String(lead?.chatConversationId || lead?.conversationId || '').trim() || null
+  const clickupTaskId = String(lead?.clickupTaskId || '').trim() || null
+
+  if (clickupTaskId) keys.add(`task:${clickupTaskId}`)
+  if (phone) keys.add(`phone:${phone}`)
+  if (bradialContactId) keys.add(`contact:${bradialContactId}`)
+  if (chatConversationId) keys.add(`conversation:${chatConversationId}`)
+  if (!keys.size) keys.add(`lead:${lead.id}`)
+
+  return [...keys]
+}
+
+function scoreLead(lead) {
+  return (
+    (lead?.clickupTaskId ? 200 : 0) +
+    (lead?.chatConversationId || lead?.conversationId ? 80 : 0) +
+    (lead?.raw?.bradialContactId || lead?.chatContactId ? 60 : 0) +
+    ((lead?.bradialLabels || lead?.raw?.bradialLabels || []).length ? 30 : 0) +
+    (lead?.clickupStage ? 20 : 0) +
+    (lead?.syncEnabled ? 10 : 0) +
+    toTimestamp(lead?.lastSyncAt)
   )
+}
+
+function choosePreferredValue(leads, selector, fallback = null) {
+  for (const lead of leads) {
+    const value = selector(lead)
+    if (value === undefined || value === null) continue
+    if (typeof value === 'string' && !value.trim()) continue
+    if (Array.isArray(value) && !value.length) continue
+    return value
+  }
+
+  return fallback
+}
+
+function chooseCanonicalLeadId(leads, preferredLead) {
+  const clickupTaskId = choosePreferredValue(leads, (lead) => lead.clickupTaskId)
+  if (clickupTaskId) return `lead-task-${clickupTaskId}`
+
+  const phone = normalizeLeadPhone(choosePreferredValue(leads, (lead) => lead.phone))
+  if (phone) return `lead-phone-${phone.replace(/[^\d]+/g, '')}`
+
+  const bradialContactId = choosePreferredValue(
+    leads,
+    (lead) => lead?.raw?.bradialContactId || lead?.chatContactId,
+  )
+  if (bradialContactId) return `lead-contact-${bradialContactId}`
+
+  return preferredLead.id
+}
+
+function mergeLeadGroup(group) {
+  const members = Array.isArray(group?.leads) ? group.leads : Array.isArray(group) ? group : []
+  const sorted = [...members].sort((left, right) => scoreLead(right) - scoreLead(left))
+  const preferredLead = sorted[0]
+  const canonicalId = chooseCanonicalLeadId(sorted, preferredLead)
+  const primaryLabels =
+    choosePreferredValue(sorted, (lead) => lead.bradialLabels) ||
+    choosePreferredValue(sorted, (lead) => lead?.raw?.bradialLabels, [])
+
+  return {
+    ...preferredLead,
+    id: canonicalId,
+    name: choosePreferredValue(sorted, (lead) => lead.name, preferredLead.name),
+    phone: choosePreferredValue(sorted, (lead) => lead.phone, preferredLead.phone),
+    email: choosePreferredValue(sorted, (lead) => lead.email, preferredLead.email),
+    clickupTaskId: choosePreferredValue(sorted, (lead) => lead.clickupTaskId),
+    clickupStage: choosePreferredValue(sorted, (lead) => lead.clickupStage),
+    clickupTaskUrl: choosePreferredValue(sorted, (lead) => lead.clickupTaskUrl),
+    clickupWorkspace: choosePreferredValue(sorted, (lead) => lead.clickupWorkspace),
+    clickupListName: choosePreferredValue(sorted, (lead) => lead.clickupListName),
+    clickupPhoneMatched: choosePreferredValue(sorted, (lead) => lead.clickupPhoneMatched),
+    conversationId: choosePreferredValue(sorted, (lead) => lead.conversationId),
+    chatConversationId: choosePreferredValue(sorted, (lead) => lead.chatConversationId),
+    chatContactId: choosePreferredValue(sorted, (lead) => lead.chatContactId),
+    owner: choosePreferredValue(sorted, (lead) => lead.owner, preferredLead.owner),
+    chatStatus: choosePreferredValue(sorted, (lead) => lead.chatStatus, preferredLead.chatStatus),
+    syncEnabled: sorted.some((lead) => lead.syncEnabled !== false),
+    health: [...sorted].sort((left, right) => healthRank(right.health) - healthRank(left.health))[0]?.health || preferredLead.health,
+    bradialLabels: primaryLabels,
+    tags: [...new Set(choosePreferredValue(sorted, (lead) => lead.tags, preferredLead.tags || []))],
+    summary: choosePreferredValue(sorted, (lead) => lead.summary, preferredLead.summary),
+    lastAction: choosePreferredValue(sorted, (lead) => lead.lastAction, preferredLead.lastAction),
+    lastSyncAt: choosePreferredValue(sorted, (lead) => lead.lastSyncAt, preferredLead.lastSyncAt),
+    matchCount: Math.max(...sorted.map((lead) => Number(lead.matchCount || 0)), 0),
+    raw: {
+      ...(preferredLead.raw || {}),
+      bradialContactId: choosePreferredValue(
+        sorted,
+        (lead) => lead?.raw?.bradialContactId || lead?.chatContactId,
+      ),
+      bradialLabels: primaryLabels,
+      bradialEmail: choosePreferredValue(sorted, (lead) => lead?.raw?.bradialEmail || lead?.email),
+      clickupTaskId: choosePreferredValue(sorted, (lead) => lead?.raw?.clickupTaskId || lead?.clickupTaskId),
+      mergedLeadIds: members.map((lead) => lead.id),
+    },
+  }
+}
+
+function consolidateLeads(leads) {
+  const groups = []
+
+  for (const lead of leads) {
+    const keys = getLeadKeys(lead)
+    const matches = groups.filter((group) => keys.some((key) => group.keys.has(key)))
+
+    if (!matches.length) {
+      groups.push({
+        keys: new Set(keys),
+        leads: [lead],
+      })
+      continue
+    }
+
+    const primaryGroup = matches[0]
+    primaryGroup.leads.push(lead)
+    keys.forEach((key) => primaryGroup.keys.add(key))
+
+    for (const duplicateGroup of matches.slice(1)) {
+      duplicateGroup.leads.forEach((item) => primaryGroup.leads.push(item))
+      duplicateGroup.keys.forEach((key) => primaryGroup.keys.add(key))
+      groups.splice(groups.indexOf(duplicateGroup), 1)
+    }
+  }
+
+  return groups.map((group) => mergeLeadGroup(group))
 }
 
 function enrichLead(lead, matchingTasks, clickupSnapshot) {
@@ -156,14 +310,29 @@ function buildClickupHealth(clickupSnapshot) {
   }
 }
 
-function buildPendingClickupContacts(taskIndex, leads, clickupSnapshot, opportunityLabel) {
+function buildPendingClickupContacts(
+  taskIndex,
+  leads,
+  clickupSnapshot,
+  stageLabelMap,
+  controlledStageLabels,
+  rawLeads = leads,
+) {
   const bradialIndex = new Map()
+  const rawBradialIndex = new Map()
 
   for (const lead of leads) {
     const phone = normalizePhone(lead.phone)
     if (!phone) continue
     if (!bradialIndex.has(phone)) bradialIndex.set(phone, [])
     bradialIndex.get(phone).push(lead)
+  }
+
+  for (const lead of rawLeads) {
+    const phone = normalizePhone(lead.phone)
+    if (!phone) continue
+    if (!rawBradialIndex.has(phone)) rawBradialIndex.set(phone, [])
+    rawBradialIndex.get(phone).push(lead)
   }
 
   return (clickupSnapshot?.tasks || [])
@@ -175,9 +344,16 @@ function buildPendingClickupContacts(taskIndex, leads, clickupSnapshot, opportun
     .map((task) => {
       const phone = normalizePhone(task.phone)
       const clickupMatches = phone ? taskIndex.get(phone) || [] : []
-      const bradialMatches = phone ? bradialIndex.get(phone) || [] : []
-      const matchedLead = bradialMatches[0] || null
-      const alreadyTagged = matchedLead ? hasOpportunityLabel(matchedLead, opportunityLabel) : false
+      const bradialMatches = phone ? rawBradialIndex.get(phone) || [] : []
+      const matchedLead = phone ? (bradialIndex.get(phone) || [])[0] || null : null
+      const targetStageLabel = resolveBradialStageLabel(task.status, stageLabelMap)
+      const alreadyTagged = matchedLead ? hasStageLabel(matchedLead, targetStageLabel) : false
+      const currentControlledLabels = matchedLead
+        ? pickControlledLabels(
+            matchedLead?.bradialLabels || matchedLead?.raw?.bradialLabels || [],
+            controlledStageLabels,
+          )
+        : []
 
       let syncState = null
       let syncAllowed = false
@@ -192,11 +368,13 @@ function buildPendingClickupContacts(taskIndex, leads, clickupSnapshot, opportun
       } else if (!matchedLead) {
         syncState = 'missing_contact'
         syncAllowed = true
-        summary = 'Task pronta para criar um novo contato no Bradial.'
+        summary = `Task pronta para criar um novo contato no Bradial com a tag ${targetStageLabel || 'de etapa'}.`
       } else if (!alreadyTagged) {
-        syncState = 'missing_opportunity_label'
+        syncState = currentControlledLabels.length ? 'stage_label_outdated' : 'missing_stage_label'
         syncAllowed = true
-        summary = `Contato encontrado no Bradial, mas ainda sem a label ${opportunityLabel}.`
+        summary = currentControlledLabels.length
+          ? `Contato encontrado no Bradial com tag de etapa ${currentControlledLabels.join(', ')}, mas a etapa atual do ClickUp exige ${targetStageLabel}.`
+          : `Contato encontrado no Bradial, mas ainda sem a tag de etapa ${targetStageLabel}.`
       }
 
       if (!syncState) return null
@@ -217,6 +395,8 @@ function buildPendingClickupContacts(taskIndex, leads, clickupSnapshot, opportun
         bradialContactId: matchedLead?.chatContactId || null,
         bradialContactName: matchedLead?.name || null,
         bradialLabels: matchedLead?.bradialLabels || matchedLead?.raw?.bradialLabels || [],
+        currentControlledLabels,
+        targetStageLabel,
         bradialMatchCount: bradialMatches.length,
         clickupMatchCount: clickupMatches.length,
         syncState,
@@ -234,7 +414,8 @@ export function buildConsolidatedSnapshot({
   accountId,
   preferredInboxId,
   lastRefreshAt,
-  opportunityLabel,
+  stageLabelMap,
+  controlledStageLabels,
 }) {
   const taskIndex = new Map()
   const snapshotAt = lastRefreshAt || new Date().toISOString()
@@ -251,12 +432,15 @@ export function buildConsolidatedSnapshot({
     const matchingTasks = phone ? taskIndex.get(phone) || [] : []
     return enrichLead(lead, matchingTasks, clickupSnapshot)
   })
+  const consolidatedLeads = consolidateLeads(leads)
 
   const pendingContacts = buildPendingClickupContacts(
     taskIndex,
-    leads,
+    consolidatedLeads,
     clickupSnapshot,
-    opportunityLabel,
+    stageLabelMap,
+    controlledStageLabels,
+    leads,
   )
 
   const exceptions = [
@@ -266,7 +450,7 @@ export function buildConsolidatedSnapshot({
 
   return {
     overview: buildOverview({
-      leads,
+      leads: consolidatedLeads,
       exceptions,
       agents: bradialSnapshot?.agents || [],
       inboxes: bradialSnapshot?.inboxes || [],
@@ -278,7 +462,7 @@ export function buildConsolidatedSnapshot({
       preferredInboxId,
       lastRefreshAt: snapshotAt,
     }),
-    leads,
+    leads: consolidatedLeads,
     exceptions,
     agents: bradialSnapshot?.agents || [],
     inboxes: bradialSnapshot?.inboxes || [],

@@ -10,12 +10,14 @@ Projeto local para consolidar dados da Bradial com o ClickUp do workspace `Alem 
 ## O que ja faz
 
 - conecta na Bradial Partner API
+- suporta sync opcional de etiquetas da conversa via API Chatwoot/Bradial quando houver token de conversa
 - conecta no ClickUp com escopo do workspace `Alem da Ideia`
 - limita a leitura comercial ao space `COMERCIAL` e pasta `Area de Vendas`
 - cruza contatos e tasks por telefone normalizado em `E.164`
 - exibe dashboard, excecoes, logs e leads enriquecidos
 - lista tasks do ClickUp que ainda precisam virar contato no Bradial
-- cria ou atualiza contato no Bradial com a label `OPORTUNIDADE`, sem enviar mensagem
+- cria ou atualiza contato no Bradial sem enviar mensagem
+- espelha a etapa do ClickUp em uma tag controlada no Bradial, removendo a tag de etapa anterior
 - gera URL por integracao para cadastro de webhook no ClickUp
 
 ## Seguranca
@@ -43,12 +45,17 @@ Variaveis principais:
 - `BRADIAL_ACCOUNT_ID`
 - `BRADIAL_API_TOKEN`
 - `BRADIAL_INBOX_ID`
+- `BRADIAL_CHAT_BASE_URL`
+- `BRADIAL_CHAT_ACCOUNT_ID`
+- `BRADIAL_CHAT_API_TOKEN`
+- `BRADIAL_CHAT_INBOX_ID`
 - `BRADIAL_OPPORTUNITY_LABEL`
 - `PUBLIC_BASE_URL`
 - `CLICKUP_API_KEY`
 - `CLICKUP_WORKSPACE_NAME`
 - `CLICKUP_COMMERCIAL_SPACE_NAME`
 - `CLICKUP_COMMERCIAL_FOLDER_NAME`
+- `CLICKUP_STAGE_LABEL_MAP`
 - `CLICKUP_WEBHOOK_SECRET`
 - `CLICKUP_INTEGRATIONS_PATH`
 
