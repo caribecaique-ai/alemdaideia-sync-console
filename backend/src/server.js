@@ -25,7 +25,20 @@ import { normalizePhone, phonesMatchLoose } from './utils/normalizers.js'
 dotenv.config()
 
 const PORT = Number(process.env.PORT || 3015)
-const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || 'http://localhost:4180'
+
+// CORS_ORIGINS aceita lista separada por vírgula. Use '*' para liberar tudo (dev only).
+// Fallback: FRONTEND_ORIGIN (compatibilidade retroativa) ou localhost:4180
+const CORS_ORIGINS = (() => {
+  const raw = String(
+    process.env.CORS_ORIGINS || process.env.FRONTEND_ORIGIN || 'http://localhost:4180',
+  ).trim()
+  if (raw === '*') return true // libera tudo
+  return [
+    ...new Set(
+      raw.split(',').map((s) => s.trim()).filter(Boolean),
+    ),
+  ]
+})()
 const BRADIAL_REFRESH_MS = Math.max(15_000, Number(process.env.BRADIAL_REFRESH_MS || 60_000))
 const BRADIAL_OPPORTUNITY_LABEL =
   String(process.env.BRADIAL_OPPORTUNITY_LABEL || 'OPORTUNIDADE').trim() || 'OPORTUNIDADE'
@@ -89,7 +102,7 @@ app.addContentTypeParser('application/json', { parseAs: 'string' }, (request, bo
 })
 
 await app.register(cors, {
-  origin: [FRONTEND_ORIGIN, 'http://127.0.0.1:4180'],
+  origin: CORS_ORIGINS,
 })
 
 const runtime = {
