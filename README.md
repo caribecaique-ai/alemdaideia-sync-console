@@ -130,3 +130,22 @@ cd ops
 - `POST /webhooks/clickup/:integrationId/:webhookToken`
 - `POST /webhooks/bradial/chatwoot`
 - `POST /refresh`
+
+## Produção na VPS
+
+Arquivos prontos no repositório:
+
+- `ecosystem.config.cjs`: processo do backend no `pm2`
+- `ops/nginx/alemdaideia-sync-console.conf`: template do `nginx`
+- `ops/deploy-hostinger.sh`: atualização rápida na VPS
+- `DEPLOY_HOSTINGER.md`: passo a passo de publicação
+
+Fluxo recomendado:
+
+1. subir a VPS com Node.js
+2. clonar o repositório
+3. configurar `backend/.env`
+4. rodar o build do frontend
+5. subir o backend com `pm2`
+6. apontar o `nginx` para `frontend/dist` e para `localhost:3015`
+7. trocar `PUBLIC_BASE_URL` e os webhooks para o domínio final

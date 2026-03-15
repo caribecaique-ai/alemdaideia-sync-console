@@ -452,7 +452,15 @@ export function createBradialAdapter(config, pushLog) {
 
     const verifiedContact = await fetchContact(contactId)
     if (normalizeLabels(verifiedContact?.labels).length) {
-      throw new Error(`Contato Bradial ${contactId} nao convergiu para limpeza das etiquetas do contato.`)
+      pushLog(
+        'warning',
+        'Limpeza de etiqueta do contato nao convergiu',
+        `Contato Bradial ${contactId} ainda manteve etiquetas de contato apos a limpeza.`,
+        {
+          contactId,
+          labels: normalizeLabels(verifiedContact?.labels),
+        },
+      )
     }
 
     return verifiedContact
@@ -796,7 +804,7 @@ export function createBradialAdapter(config, pushLog) {
     )
     const targetAccountLabel = await resolveAccountLabelTitle(targetStageLabel || opportunityLabel)
     const targetConversationLabel = toConversationLabelValue(targetAccountLabel)
-    const currentChatContactLabels = effectiveChatContactId
+    const currentChatContactLabels = syncContactLabels && effectiveChatContactId
       ? await listChatContactLabels(effectiveChatContactId).catch(() => [])
       : []
     const nextChatContactLabels = syncContactLabels
@@ -806,32 +814,26 @@ export function createBradialAdapter(config, pushLog) {
         )
       : []
 
-    let contactLabelOperation = syncContactLabels
-      ? 'noop'
-      : effectiveChatContactId
-        ? 'clear'
-        : 'disabled'
+    let contactLabelOperation = syncContactLabels ? 'noop' : 'disabled'
     let syncedChatContactLabels = currentChatContactLabels
 
     const contactLabelsChanged = syncContactLabels
       ? !labelsEqual(currentChatContactLabels, nextChatContactLabels)
-      : Boolean(effectiveChatContactId)
+      : false
 
     if (contactLabelsChanged) {
-      contactLabelOperation = syncContactLabels ? 'update' : 'clear'
+      contactLabelOperation = 'update'
       syncedChatContactLabels = dryRun
         ? nextChatContactLabels
-        : syncContactLabels
-          ? currentChatContactLabels
-          : []
+        : currentChatContactLabels
     }
 
     const applyChatContactLabelState = async () => {
-      if (!contactLabelsChanged || dryRun || !effectiveChatContactId) {
+      if (!syncContactLabels || !contactLabelsChanged || dryRun || !effectiveChatContactId) {
         return syncedChatContactLabels
       }
 
-      const expectedLabels = syncContactLabels ? nextChatContactLabels : []
+      const expectedLabels = nextChatContactLabels
 
       return applyAndVerifyLabelSet({
         shouldUpdate: true,
@@ -1087,13 +1089,15 @@ export function createBradialAdapter(config, pushLog) {
       controlledStageLabels: options.controlledStageLabels,
     })
     const createPayload = buildContactPayload(task, existingLead, {
-      includeLabels: true,
+      includeLabels: syncContactLabels,
       targetStageLabel,
       controlledStageLabels: options.controlledStageLabels,
     })
-    createPayload.labels = await Promise.all(
-      (createPayload.labels || []).map((label) => resolveAccountLabelTitle(label)),
-    )
+    if (syncContactLabels) {
+      createPayload.labels = await Promise.all(
+        (createPayload.labels || []).map((label) => resolveAccountLabelTitle(label)),
+      )
+    }
     const previousStageLabels = pickControlledLabels(
       existingLead?.bradialLabels || existingLead?.raw?.bradialLabels || [],
       options.controlledStageLabels,
@@ -1238,16 +1242,16 @@ export function createBradialAdapter(config, pushLog) {
     if (!dryRun && resolvedPartnerContactId && contactOperation !== 'noop') {
       const verifiedContact = await fetchContact(resolvedPartnerContactId)
       const verifiedLabels = normalizeLabels(verifiedContact?.labels)
-      if (contactOperation === 'create' && !labelsEqual(verifiedLabels, createPayload.labels || [])) {
+      if (
+        syncContactLabels &&
+        contactOperation === 'create' &&
+        !labelsEqual(verifiedLabels, createPayload.labels || [])
+      ) {
         throw new Error(
           `Contato Bradial ${resolvedPartnerContactId} nao convergiu para as etiquetas esperadas.`,
         )
       }
       resolvedContact = verifiedContact
-    }
-
-    if (!dryRun && resolvedPartnerContactId && !syncContactLabels) {
-      resolvedContact = await clearPartnerContactLabels(resolvedPartnerContactId)
     }
 
     let consolidatedChatContact = null

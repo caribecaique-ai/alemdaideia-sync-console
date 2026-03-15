@@ -177,6 +177,12 @@ const syncAuditStore = createSyncAuditStore(
   pushLog,
 )
 
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms)
+  })
+}
+
 function pushSyncAudit(entry = {}) {
   const auditEntry = {
     id: entry.id || `${Date.now()}-${Math.random().toString(16).slice(2, 10)}`,
@@ -860,6 +866,16 @@ function normalizeWebhookLabels(labels) {
   }
 
   return []
+}
+
+function normalizedLabelSet(labels = []) {
+  return [...new Set(normalizeWebhookLabels(labels).map((label) => normalizeLabelKey(label)).filter(Boolean))].sort()
+}
+
+function sameNormalizedLabels(left = [], right = []) {
+  const leftSet = normalizedLabelSet(left)
+  const rightSet = normalizedLabelSet(right)
+  return leftSet.length === rightSet.length && leftSet.every((item, index) => item === rightSet[index])
 }
 
 function extractBradialChangedLabels(payload = {}) {
@@ -1645,15 +1661,34 @@ async function syncBradialStageToClickup(payload, options = {}) {
     }
   }
 
+  const controlledStageLabels = getControlledStageLabels()
   let labels = normalizeWebhookLabels(envelope.labels)
+
   if (envelope.conversationId && bradial.chatEnabled) {
-    const liveConversationLabels = await bradial.fetchConversationLabels(envelope.conversationId).catch(() => [])
-    if (liveConversationLabels.length) {
-      labels = liveConversationLabels
+    const changedControlledLabels = pickControlledLabels(envelope.changedLabels || [], controlledStageLabels)
+    const fallbackLabels = changedControlledLabels.length
+      ? normalizeWebhookLabels(envelope.changedLabels)
+      : labels
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const liveConversationLabels = await bradial.fetchConversationLabels(envelope.conversationId).catch(() => [])
+      const liveControlledLabels = pickControlledLabels(liveConversationLabels, controlledStageLabels)
+
+      if (liveControlledLabels.length) {
+        labels = liveConversationLabels
+        if (!changedControlledLabels.length || sameNormalizedLabels(liveControlledLabels, changedControlledLabels)) {
+          break
+        }
+      } else if (changedControlledLabels.length) {
+        labels = fallbackLabels
+      }
+
+      if (attempt < 3) {
+        await sleep(150 * attempt)
+      }
     }
   }
 
-  const controlledStageLabels = getControlledStageLabels()
   const currentControlledLabels = pickControlledLabels(labels, controlledStageLabels)
 
   if (!currentControlledLabels.length) {
