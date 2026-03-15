@@ -12,7 +12,13 @@ import { createSyncJobStore } from './services/syncJobStore.js'
 import {
   buildStageLabelMap,
   listControlledStageLabels,
+  normalizeLabelKey,
+  pickControlledLabels,
+  resolveClickupStatusFromLabel,
 } from './services/clickupStageLabels.js'
+import {
+  resolveClickupPhoneConflict,
+} from './services/clickupTaskResolution.js'
 import { buildConsolidatedSnapshot } from './services/consolidation.js'
 import { normalizePhone, phonesMatchLoose } from './utils/normalizers.js'
 
@@ -26,6 +32,9 @@ const BRADIAL_OPPORTUNITY_LABEL =
 const BRADIAL_SYNC_CONVERSATION_LABELS = !['0', 'false', 'no', 'off'].includes(
   String(process.env.BRADIAL_SYNC_CONVERSATION_LABELS || 'true').trim().toLowerCase(),
 )
+const BRADIAL_SYNC_CONTACT_LABELS = !['0', 'false', 'no', 'off'].includes(
+  String(process.env.BRADIAL_SYNC_CONTACT_LABELS || 'false').trim().toLowerCase(),
+)
 const SYNC_MAX_ATTEMPTS = Math.max(1, Number(process.env.SYNC_MAX_ATTEMPTS || 4))
 const SYNC_RETRY_BASE_MS = Math.max(500, Number(process.env.SYNC_RETRY_BASE_MS || 1_500))
 const SYNC_CONCURRENCY = Math.max(1, Number(process.env.SYNC_CONCURRENCY || 6))
@@ -38,6 +47,15 @@ const SYNC_RECONCILE_LOOKBACK_MS = Math.max(
 const DEFERRED_REFRESH_MS = Math.max(100, Number(process.env.DEFERRED_REFRESH_MS || 150))
 const CLICKUP_STAGE_LABEL_MAP = buildStageLabelMap(process.env.CLICKUP_STAGE_LABEL_MAP)
 const CLICKUP_WEBHOOK_SECRET = String(process.env.CLICKUP_WEBHOOK_SECRET || '').trim()
+const BRADIAL_CHAT_WEBHOOK_SECRET = String(process.env.BRADIAL_CHAT_WEBHOOK_SECRET || '').trim()
+const BRADIAL_CHAT_WEBHOOK_MAX_AGE_SEC = Math.max(
+  0,
+  Number(process.env.BRADIAL_CHAT_WEBHOOK_MAX_AGE_SEC || 300),
+)
+const BRADIAL_STAGE_SUPPRESSION_WINDOW_MS = Math.max(
+  30_000,
+  Number(process.env.BRADIAL_STAGE_SUPPRESSION_WINDOW_MS || 120_000),
+)
 const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || '').trim()
 const CLICKUP_INTEGRATIONS_PATH =
   String(process.env.CLICKUP_INTEGRATIONS_PATH || '').trim() ||
@@ -122,6 +140,7 @@ let inflightStageReconcile = null
 let deferredRefreshTimer = null
 let syncStatePersistTimer = null
 const sseClients = new Set()
+const recentStageSyncSuppressions = new Map()
 
 function broadcastSse(event, payload = {}) {
   const message = `event: ${event}\ndata: ${JSON.stringify({
@@ -191,6 +210,7 @@ const bradial = createBradialAdapter(
     opportunityLabel: BRADIAL_OPPORTUNITY_LABEL,
     stageLabelMap: CLICKUP_STAGE_LABEL_MAP,
     syncConversationLabels: BRADIAL_SYNC_CONVERSATION_LABELS,
+    syncContactLabels: BRADIAL_SYNC_CONTACT_LABELS,
     requestMaxAttempts: process.env.BRADIAL_REQUEST_MAX_ATTEMPTS,
     requestRetryBaseMs: process.env.BRADIAL_REQUEST_RETRY_BASE_MS,
     conversationSearchPages: process.env.BRADIAL_CONVERSATION_SEARCH_PAGES,
@@ -333,6 +353,121 @@ async function queueStageReconcile(trigger) {
   }
 }
 
+async function overlayConversationStageLabels(bradialSnapshot, trigger = 'manual') {
+  if (BRADIAL_SYNC_CONTACT_LABELS || !bradial.chatEnabled) {
+    return bradialSnapshot
+  }
+
+  const links = leadLinkStore.listLinks()
+  if (!Array.isArray(bradialSnapshot?.leads) || !bradialSnapshot.leads.length) {
+    return bradialSnapshot
+  }
+
+  const linksByContactId = new Map()
+  const linksByPhone = new Map()
+  for (const link of links) {
+    const contactId = String(link?.bradialContactId || '').trim()
+    const phone = normalizePhone(link?.phone)
+    if (contactId && !linksByContactId.has(contactId)) {
+      linksByContactId.set(contactId, link)
+    }
+    if (phone && !linksByPhone.has(phone)) {
+      linksByPhone.set(phone, link)
+    }
+  }
+
+  const cachedLabelsByConversationId = new Map()
+  const cachedLabelsByContactId = new Map()
+  const cachedLabelsByPhone = new Map()
+
+  for (const lead of runtime.cache.leads || []) {
+    const labels = normalizeWebhookLabels(lead?.bradialLabels || lead?.raw?.bradialLabels || [])
+    const conversationId = String(lead?.conversationId || lead?.chatConversationId || '').trim()
+    const contactId = String(lead?.raw?.bradialContactId || lead?.chatContactId || '').trim()
+    const phone = normalizePhone(lead?.phone)
+
+    if (conversationId && labels.length && !cachedLabelsByConversationId.has(conversationId)) {
+      cachedLabelsByConversationId.set(conversationId, labels)
+    }
+    if (contactId && labels.length && !cachedLabelsByContactId.has(contactId)) {
+      cachedLabelsByContactId.set(contactId, labels)
+    }
+    if (phone && labels.length && !cachedLabelsByPhone.has(phone)) {
+      cachedLabelsByPhone.set(phone, labels)
+    }
+  }
+
+  const conversationIdsToFetch = [
+    ...new Set(
+      bradialSnapshot.leads
+        .map((lead) => {
+          const contactId = String(lead?.raw?.bradialContactId || lead?.chatContactId || '').trim()
+          const phone = normalizePhone(lead?.phone)
+          const link = linksByContactId.get(contactId) || linksByPhone.get(phone) || null
+          return String(link?.conversationId || '').trim()
+        })
+        .filter((conversationId) => conversationId && !cachedLabelsByConversationId.has(conversationId)),
+    ),
+  ]
+
+  const fetchedLabelsByConversationId = new Map()
+  const chunkSize = 8
+  for (let index = 0; index < conversationIdsToFetch.length; index += chunkSize) {
+    const chunk = conversationIdsToFetch.slice(index, index + chunkSize)
+    const rows = await Promise.all(
+      chunk.map(async (conversationId) => {
+        try {
+          const labels = normalizeWebhookLabels(await bradial.fetchConversationLabels(conversationId))
+          return [conversationId, labels]
+        } catch (error) {
+          pushLog(
+            'warning',
+            'Falha ao sobrepor labels de conversa no snapshot',
+            error.message,
+            { trigger, conversationId },
+          )
+          return [conversationId, []]
+        }
+      }),
+    )
+
+    for (const [conversationId, labels] of rows) {
+      fetchedLabelsByConversationId.set(conversationId, labels)
+    }
+  }
+
+  return {
+    ...bradialSnapshot,
+    leads: bradialSnapshot.leads.map((lead) => {
+      const contactId = String(lead?.raw?.bradialContactId || lead?.chatContactId || '').trim()
+      const phone = normalizePhone(lead?.phone)
+      const link = linksByContactId.get(contactId) || linksByPhone.get(phone) || null
+      const conversationId =
+        String(link?.conversationId || lead?.chatConversationId || lead?.conversationId || '').trim() || null
+      const conversationLabels =
+        (conversationId && fetchedLabelsByConversationId.get(conversationId)) ||
+        (conversationId && cachedLabelsByConversationId.get(conversationId)) ||
+        cachedLabelsByContactId.get(contactId) ||
+        cachedLabelsByPhone.get(phone) ||
+        []
+      const normalizedLabels = normalizeWebhookLabels(conversationLabels)
+
+      return {
+        ...lead,
+        bradialLabels: normalizedLabels,
+        tags: mergeLeadDisplayTags(lead.tags, normalizedLabels),
+        conversationId: conversationId || lead.conversationId,
+        chatConversationId: conversationId || lead.chatConversationId,
+        raw: {
+          ...(lead.raw || {}),
+          partnerContactLabels: normalizeWebhookLabels(lead?.raw?.bradialLabels || lead?.bradialLabels || []),
+          bradialLabels: normalizedLabels,
+        },
+      }
+    }),
+  }
+}
+
 async function refreshSnapshot(trigger = 'manual') {
   pushLog('info', 'Atualizando snapshot integrado', `Inicio do refresh por ${trigger}`)
 
@@ -370,11 +505,54 @@ async function refreshSnapshot(trigger = 'manual') {
     pushLog('warning', 'ClickUp degradado', runtime.errors.clickup)
   }
 
+  let bradialSnapshot = bradialResult.value
+  const linkedBradialContactIds = [
+    ...new Set(
+      leadLinkStore
+        .listLinks()
+        .map((item) => String(item?.bradialContactId || '').trim())
+        .filter(Boolean),
+    ),
+  ]
+  const knownBradialContactIds = new Set(
+    (bradialSnapshot?.contacts || []).map((item) => String(item?.id || '').trim()).filter(Boolean),
+  )
+  const missingLinkedContactIds = linkedBradialContactIds.filter((contactId) => !knownBradialContactIds.has(contactId))
+
+  if (missingLinkedContactIds.length) {
+    try {
+      const hydratedLinked = await bradial.hydrateContactsByIds(
+        missingLinkedContactIds,
+        bradialSnapshot?.snapshotAt || snapshotAt,
+      )
+
+      if (hydratedLinked.contacts.length || hydratedLinked.leads.length) {
+        bradialSnapshot = {
+          ...bradialSnapshot,
+          contacts: [...(bradialSnapshot.contacts || []), ...hydratedLinked.contacts],
+          leads: [...(bradialSnapshot.leads || []), ...hydratedLinked.leads],
+        }
+      }
+    } catch (error) {
+      pushLog(
+        'warning',
+        'Falha ao reidratar contatos vinculados fora do snapshot da Bradial',
+        error.message,
+        {
+          trigger,
+          missingLinkedContactIds,
+        },
+      )
+    }
+  }
+
+  bradialSnapshot = await overlayConversationStageLabels(bradialSnapshot, trigger)
+
   const previousTaskStateIndex = runtime.clickupTaskStateIndex
 
   runtime.lastRefreshAt = snapshotAt
   runtime.cache = buildConsolidatedSnapshot({
-    bradialSnapshot: bradialResult.value,
+    bradialSnapshot,
     clickupSnapshot,
     accountId: process.env.BRADIAL_ACCOUNT_ID || null,
     preferredInboxId: process.env.BRADIAL_INBOX_ID || null,
@@ -495,6 +673,107 @@ function findLeadMatchesByPhone(phone) {
   return runtime.cache.leads.filter((lead) => phonesMatchLoose(lead.phone, normalizedPhone))
 }
 
+function mergeLeadDisplayTags(existingTags = [], controlledLabels = []) {
+  const controlledKeys = new Set(
+    normalizeWebhookLabels(controlledLabels).map((label) => normalizeLabelKey(label)).filter(Boolean),
+  )
+  const preserved = Array.isArray(existingTags)
+    ? existingTags.filter((tag) => !controlledKeys.has(normalizeLabelKey(tag)))
+    : []
+
+  return [...new Set([...preserved, ...normalizeWebhookLabels(controlledLabels)])]
+}
+
+function patchRuntimeClickupTask(updatedTask = {}) {
+  const taskId = String(updatedTask?.id || '').trim()
+  if (!taskId) return false
+
+  const tasks = Array.isArray(runtime.cache.clickup.tasks) ? [...runtime.cache.clickup.tasks] : []
+  const index = tasks.findIndex((task) => String(task.id) === taskId)
+  if (index < 0) return false
+
+  tasks[index] = {
+    ...tasks[index],
+    ...updatedTask,
+  }
+
+  runtime.cache.clickup.tasks = tasks.sort(
+    (left, right) => Number(right.dateUpdated || 0) - Number(left.dateUpdated || 0),
+  )
+  runtime.clickupTaskStateIndex = buildClickupTaskStateIndex(runtime.cache.clickup.tasks)
+
+  if (Array.isArray(runtime.cache.clickup.pendingContacts)) {
+    runtime.cache.clickup.pendingContacts = runtime.cache.clickup.pendingContacts.map((item) =>
+      String(item.taskId) === taskId
+        ? {
+            ...item,
+            status: updatedTask.status || item.status,
+            stageLabel:
+              CLICKUP_STAGE_LABEL_MAP[normalizeLabelKey(updatedTask.status)] || item.stageLabel || null,
+          }
+        : item,
+    )
+  }
+
+  return true
+}
+
+function patchRuntimeLeadState({
+  taskId = null,
+  phone = null,
+  chatContactId = null,
+  conversationId = null,
+  clickupStage = null,
+  bradialLabels = null,
+  lastSyncAt = null,
+} = {}) {
+  const normalizedTaskId = String(taskId || '').trim()
+  const normalizedPhone = normalizePhone(phone)
+  const normalizedChatContactId = String(chatContactId || '').trim()
+  const normalizedConversationId = String(conversationId || '').trim()
+  const normalizedLabels = Array.isArray(bradialLabels) ? normalizeWebhookLabels(bradialLabels) : null
+  const syncAt = lastSyncAt || new Date().toISOString()
+  let changed = false
+
+  runtime.cache.leads = runtime.cache.leads.map((lead) => {
+    const leadTaskId = String(lead.clickupTaskId || '').trim()
+    const leadPhone = normalizePhone(lead.phone)
+    const leadChatContactId = String(lead.chatContactId || '').trim()
+    const leadConversationId = String(lead.conversationId || lead.chatConversationId || '').trim()
+
+    const matches =
+      (normalizedTaskId && leadTaskId === normalizedTaskId) ||
+      (normalizedPhone && leadPhone && phonesMatchLoose(leadPhone, normalizedPhone)) ||
+      (normalizedChatContactId && leadChatContactId === normalizedChatContactId) ||
+      (normalizedConversationId && leadConversationId === normalizedConversationId)
+
+    if (!matches) return lead
+
+    changed = true
+    const nextRaw = {
+      ...(lead.raw || {}),
+    }
+
+    if (normalizedLabels) {
+      nextRaw.bradialLabels = normalizedLabels
+    }
+
+    return {
+      ...lead,
+      clickupStage: clickupStage || lead.clickupStage,
+      bradialLabels: normalizedLabels || lead.bradialLabels,
+      tags: normalizedLabels ? mergeLeadDisplayTags(lead.tags, normalizedLabels) : lead.tags,
+      chatContactId: normalizedChatContactId || lead.chatContactId,
+      conversationId: normalizedConversationId || lead.conversationId,
+      chatConversationId: normalizedConversationId || lead.chatConversationId,
+      lastSyncAt: syncAt,
+      raw: nextRaw,
+    }
+  })
+
+  return changed
+}
+
 function parseBooleanFlag(value) {
   return ['1', 'true', 'yes', 'on'].includes(String(value || '').trim().toLowerCase())
 }
@@ -508,11 +787,12 @@ function findLeadLink(taskId, phone = null) {
 
 function resolveBradialContactId(contact, fallbackLead = null) {
   return (
-    contact?.chatContactId ||
     contact?.raw?.bradialContactId ||
-    fallbackLead?.chatContactId ||
-    fallbackLead?.raw?.bradialContactId ||
     contact?.id ||
+    contact?.chatContactId ||
+    fallbackLead?.raw?.bradialContactId ||
+    fallbackLead?.id ||
+    fallbackLead?.chatContactId ||
     null
   )
 }
@@ -553,6 +833,149 @@ function extractClickupWebhookEnvelope(payload) {
 
 function buildIntegrationWebhookKey(integrationId, payload) {
   return `${integrationId}:${buildClickupWebhookKey(payload)}`
+}
+
+function normalizeWebhookLabels(labels) {
+  if (Array.isArray(labels)) {
+    return [
+      ...new Set(
+        labels
+          .map((item) => {
+            if (typeof item === 'string') return item.trim()
+            if (item && typeof item === 'object') {
+              return String(item.title || item.name || item.label || '').trim()
+            }
+            return ''
+          })
+          .filter(Boolean),
+      ),
+    ]
+  }
+
+  if (typeof labels === 'string') {
+    return labels
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean)
+  }
+
+  return []
+}
+
+function extractBradialChangedLabels(payload = {}) {
+  const changedAttributes = Array.isArray(payload.changed_attributes)
+    ? payload.changed_attributes
+    : Array.isArray(payload.changedAttributes)
+      ? payload.changedAttributes
+      : []
+
+  for (const item of changedAttributes) {
+    const key = normalizeLabelKey(
+      item?.key || item?.attribute_key || item?.field || item?.name || '',
+    )
+
+    if (!['label', 'labels'].includes(key)) continue
+
+    return normalizeWebhookLabels(
+      item?.current_value ?? item?.currentValue ?? item?.value ?? item?.new_value ?? [],
+    )
+  }
+
+  return []
+}
+
+function extractBradialWebhookEnvelope(payload = {}) {
+  const conversation =
+    payload?.conversation && typeof payload.conversation === 'object' ? payload.conversation : payload
+  const sender = conversation?.meta?.sender || payload?.contact || {}
+  const changedLabels = extractBradialChangedLabels(payload)
+  const labels = changedLabels.length
+    ? changedLabels
+    : normalizeWebhookLabels(
+        conversation?.labels || payload?.labels || payload?.contact?.labels || sender?.labels || [],
+      )
+
+  return {
+    event: String(payload?.event || '').trim(),
+    conversationId: String(conversation?.id || payload?.conversation_id || '').trim() || null,
+    chatContactId:
+      String(
+        payload?.contact?.id ||
+          sender?.id ||
+          conversation?.contact_id ||
+          conversation?.meta?.sender?.id ||
+          '',
+      ).trim() || null,
+    phone:
+      normalizePhone(
+        payload?.contact?.phone_number ||
+          payload?.contact?.phoneNumber ||
+          sender?.phone_number ||
+          sender?.phoneNumber ||
+          '',
+      ) || null,
+    labels,
+    changedLabels,
+    changedAttributes: Array.isArray(payload?.changed_attributes) ? payload.changed_attributes : [],
+  }
+}
+
+function buildBradialWebhookKey(request, envelope, payload = {}) {
+  return [
+    'bradial-chat',
+    String(request.headers['x-chatwoot-delivery'] || request.headers['x-request-id'] || '').trim() ||
+      String(payload?.id || envelope.conversationId || envelope.chatContactId || 'no-identity').trim(),
+    envelope.event || 'unknown',
+    envelope.conversationId || envelope.chatContactId || envelope.phone || 'no-target',
+    normalizeWebhookLabels(envelope.labels).join('|') || 'no-labels',
+  ].join(':')
+}
+
+function cleanupStageSyncSuppressions() {
+  const now = Date.now()
+  for (const [key, value] of recentStageSyncSuppressions.entries()) {
+    if (!value || Number(value.expiresAt || 0) <= now) {
+      recentStageSyncSuppressions.delete(key)
+    }
+  }
+}
+
+function buildStageSyncSuppressionKeys({ taskId = null, conversationId = null, chatContactId = null, label = null } = {}) {
+  const normalizedLabel = normalizeLabelKey(label)
+  if (!normalizedLabel) return []
+
+  const keys = []
+  if (taskId) keys.push(`task:${String(taskId).trim()}:${normalizedLabel}`)
+  if (conversationId) keys.push(`conversation:${String(conversationId).trim()}:${normalizedLabel}`)
+  if (chatContactId) keys.push(`chat-contact:${String(chatContactId).trim()}:${normalizedLabel}`)
+  return keys
+}
+
+function rememberOutboundBradialStageSync(identity = {}) {
+  const keys = buildStageSyncSuppressionKeys(identity)
+  if (!keys.length) return
+
+  cleanupStageSyncSuppressions()
+  const expiresAt = Date.now() + BRADIAL_STAGE_SUPPRESSION_WINDOW_MS
+
+  for (const key of keys) {
+    recentStageSyncSuppressions.set(key, {
+      ...identity,
+      expiresAt,
+    })
+  }
+}
+
+function shouldSuppressBradialStageSync(identity = {}) {
+  const keys = buildStageSyncSuppressionKeys(identity)
+  if (!keys.length) return false
+
+  cleanupStageSyncSuppressions()
+  const now = Date.now()
+  return keys.some((key) => {
+    const hit = recentStageSyncSuppressions.get(key)
+    return hit && Number(hit.expiresAt || 0) > now
+  })
 }
 
 function rememberWebhookKey(webhookKey) {
@@ -794,6 +1217,8 @@ function scheduleSyncRetry(job, error) {
 }
 
 function scheduleConversationRecovery(job, result) {
+  const hadKnownConversation = Boolean(result?.conversationSync?.knownConversationId)
+  if (!hadKnownConversation) return false
   if (job.attempt >= job.maxAttempts) return false
 
   const taskId = job.taskId
@@ -1092,6 +1517,297 @@ function validateClickupIntegrationRequest(request, integration) {
   }
 }
 
+function validateBradialChatWebhookRequest(request) {
+  if (!BRADIAL_CHAT_WEBHOOK_SECRET) {
+    return {
+      ok: true,
+      reason: 'unsigned',
+    }
+  }
+
+  const signature = String(
+    request.headers['x-chatwoot-signature'] || request.headers['x-hub-signature-256'] || '',
+  ).trim()
+  const timestamp = String(
+    request.headers['x-chatwoot-timestamp'] || request.headers['x-request-timestamp'] || '',
+  ).trim()
+
+  if (!signature) {
+    return {
+      ok: false,
+      reason: 'missing_signature',
+    }
+  }
+
+  if (BRADIAL_CHAT_WEBHOOK_MAX_AGE_SEC > 0 && timestamp) {
+    const timestampSeconds = Number(timestamp)
+    if (!Number.isFinite(timestampSeconds)) {
+      return {
+        ok: false,
+        reason: 'invalid_timestamp',
+      }
+    }
+
+    const ageSeconds = Math.abs(Math.floor(Date.now() / 1000) - timestampSeconds)
+    if (ageSeconds > BRADIAL_CHAT_WEBHOOK_MAX_AGE_SEC) {
+      return {
+        ok: false,
+        reason: 'stale_timestamp',
+      }
+    }
+  }
+
+  const rawBody = request.rawBody || ''
+  const expectedCandidates = []
+
+  if (timestamp) {
+    expectedCandidates.push(
+      crypto.createHmac('sha256', BRADIAL_CHAT_WEBHOOK_SECRET).update(`${timestamp}.${rawBody}`).digest('hex'),
+    )
+  }
+
+  expectedCandidates.push(
+    crypto.createHmac('sha256', BRADIAL_CHAT_WEBHOOK_SECRET).update(rawBody).digest('hex'),
+  )
+
+  const normalizedSignature = signature.replace(/^sha256=/i, '')
+
+  const matched = expectedCandidates.some((expected) => {
+    if (normalizedSignature.length !== expected.length) return false
+    return crypto.timingSafeEqual(Buffer.from(normalizedSignature), Buffer.from(expected))
+  })
+
+  return {
+    ok: matched,
+    reason: matched ? 'validated' : 'invalid_signature',
+  }
+}
+
+function findClickupTaskFromBradialEnvelope(envelope) {
+  const link = leadLinkStore.findLinkByIdentity({
+    conversationId: envelope.conversationId,
+    chatContactId: envelope.chatContactId,
+    phone: envelope.phone,
+  })
+
+  if (link?.taskId) {
+    const linkedTask =
+      runtime.cache.clickup.tasks.find((task) => String(task.id) === String(link.taskId)) || null
+
+    return {
+      task: linkedTask,
+      link,
+      resolution: linkedTask ? 'lead_link' : 'stale_lead_link',
+    }
+  }
+
+  if (!envelope.phone) {
+    return {
+      task: null,
+      link: null,
+      resolution: 'missing_phone',
+    }
+  }
+
+  const matches = runtime.cache.clickup.tasks.filter((task) => phonesMatchLoose(task.phone, envelope.phone))
+  const clickupResolution = resolveClickupPhoneConflict(matches, envelope.phone)
+
+  if (clickupResolution.shouldBlock) {
+    return {
+      task: null,
+      link: null,
+      resolution: 'ambiguous_clickup_phone',
+      matchCount: clickupResolution.activeMatches.length,
+    }
+  }
+
+  return {
+    task: clickupResolution.canonicalTask || matches[0] || null,
+    link: null,
+    resolution: clickupResolution.canonicalTask ? 'phone_match' : 'not_found',
+  }
+}
+
+async function syncBradialStageToClickup(payload, options = {}) {
+  const trigger = String(options.trigger || 'bradial-webhook').trim() || 'bradial-webhook'
+  if (!runtime.lastRefreshAt) {
+    await ensureSnapshot(`${trigger}-bootstrap`)
+  }
+
+  const envelope = extractBradialWebhookEnvelope(payload)
+  const supportedEvents = ['conversation_created', 'conversation_updated']
+  if (!supportedEvents.includes(envelope.event)) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: 'unsupported_event',
+      event: envelope.event,
+    }
+  }
+
+  let labels = normalizeWebhookLabels(envelope.labels)
+  if (envelope.conversationId && bradial.chatEnabled) {
+    const liveConversationLabels = await bradial.fetchConversationLabels(envelope.conversationId).catch(() => [])
+    if (liveConversationLabels.length) {
+      labels = liveConversationLabels
+    }
+  }
+
+  const controlledStageLabels = getControlledStageLabels()
+  const currentControlledLabels = pickControlledLabels(labels, controlledStageLabels)
+
+  if (!currentControlledLabels.length) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: 'no_controlled_stage_label',
+      event: envelope.event,
+      conversationId: envelope.conversationId,
+    }
+  }
+
+  if (currentControlledLabels.length > 1) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: 'ambiguous_bradial_stage_label',
+      labels: currentControlledLabels,
+      conversationId: envelope.conversationId,
+    }
+  }
+
+  const targetLabel = currentControlledLabels[0]
+  const located = findClickupTaskFromBradialEnvelope({
+    ...envelope,
+    labels,
+  })
+
+  if (!located.task) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: located.resolution || 'clickup_task_not_found',
+      phone: envelope.phone,
+      conversationId: envelope.conversationId,
+      chatContactId: envelope.chatContactId,
+      matchCount: located.matchCount || 0,
+      targetLabel,
+    }
+  }
+
+  if (
+    shouldSuppressBradialStageSync({
+      taskId: located.task.id,
+      conversationId: envelope.conversationId,
+      chatContactId: envelope.chatContactId,
+      label: targetLabel,
+    })
+  ) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: 'suppressed_self_echo',
+      taskId: located.task.id,
+      targetLabel,
+      conversationId: envelope.conversationId,
+    }
+  }
+
+  const targetStatus = resolveClickupStatusFromLabel(
+    targetLabel,
+    process.env.CLICKUP_STAGE_LABEL_MAP || null,
+  )
+  if (!targetStatus) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: 'unmapped_bradial_stage_label',
+      targetLabel,
+      taskId: located.task.id,
+    }
+  }
+
+  if (normalizeLabelKey(located.task.status) === normalizeLabelKey(targetStatus)) {
+    if (envelope.phone || envelope.conversationId || envelope.chatContactId) {
+      leadLinkStore.upsertLink({
+        taskId: located.task.id,
+        phone: envelope.phone || located.task.phone || null,
+        bradialContactId: located.link?.bradialContactId || null,
+        chatContactId: envelope.chatContactId || located.link?.chatContactId || null,
+        conversationId: envelope.conversationId || located.link?.conversationId || null,
+      })
+    }
+
+    return {
+      ok: true,
+      skipped: false,
+      operation: 'noop',
+      taskId: located.task.id,
+      targetStatus,
+      targetLabel,
+      reason: 'already_in_sync',
+    }
+  }
+
+  const updatedTask = await clickup.updateTaskStatus(located.task.id, targetStatus, trigger)
+  patchRuntimeClickupTask(updatedTask)
+  leadLinkStore.upsertLink({
+    taskId: located.task.id,
+    phone: normalizePhone(updatedTask?.phone || envelope.phone || located.task.phone || ''),
+    bradialContactId: located.link?.bradialContactId || null,
+    chatContactId: envelope.chatContactId || located.link?.chatContactId || null,
+    conversationId: envelope.conversationId || located.link?.conversationId || null,
+  })
+
+  pushLog(
+    'success',
+    'Sync Bradial -> ClickUp',
+    `${located.task.name} movida para ${targetStatus} a partir da tag ${targetLabel} no Bradial.`,
+    {
+      taskId: located.task.id,
+      conversationId: envelope.conversationId,
+      chatContactId: envelope.chatContactId,
+      targetLabel,
+      targetStatus,
+      trigger,
+    },
+  )
+
+  pushSyncAudit({
+    type: 'sync_bradial_to_clickup',
+    level: 'success',
+    taskId: located.task.id,
+    trigger,
+    source: 'bradial-chat-webhook',
+    conversationId: envelope.conversationId,
+    chatContactId: envelope.chatContactId,
+    targetLabel,
+    targetStatus,
+  })
+
+  patchRuntimeLeadState({
+    taskId: located.task.id,
+    phone: normalizePhone(updatedTask?.phone || envelope.phone || located.task.phone || ''),
+    chatContactId: envelope.chatContactId || located.link?.chatContactId || null,
+    conversationId: envelope.conversationId || located.link?.conversationId || null,
+    clickupStage: targetStatus,
+    bradialLabels: [targetLabel],
+  })
+
+  scheduleDeferredSnapshotRefresh(`${trigger}-deferred`)
+
+  return {
+    ok: true,
+    skipped: false,
+    operation: 'update',
+    taskId: located.task.id,
+    targetStatus,
+    targetLabel,
+    conversationId: envelope.conversationId,
+    chatContactId: envelope.chatContactId,
+  }
+}
+
 async function syncClickupTaskToBradial(taskId, options = {}) {
   const dryRun = Boolean(options.dryRun)
   const trigger = String(options.trigger || 'manual').trim() || 'manual'
@@ -1146,14 +1862,31 @@ async function syncClickupTaskToBradial(taskId, options = {}) {
   const clickupMatches = runtime.cache.clickup.tasks.filter(
     (item) => phonesMatchLoose(item.phone, normalizedPhone),
   )
-  if (clickupMatches.length > 1) {
+  const clickupResolution = resolveClickupPhoneConflict(clickupMatches, normalizedPhone)
+
+  if (clickupResolution.ambiguous) {
     return {
       ok: false,
       skipped: true,
       reason: 'ambiguous_clickup_phone',
       taskId,
       phone: normalizedPhone,
-      matchCount: clickupMatches.length,
+      matchCount: clickupResolution.activeMatches.length,
+    }
+  }
+
+  if (
+    clickupResolution.canonicalTask?.id &&
+    String(clickupResolution.canonicalTask.id) !== String(taskId)
+  ) {
+    return {
+      ok: false,
+      skipped: true,
+      reason: 'suppressed_clickup_duplicate',
+      taskId,
+      phone: normalizedPhone,
+      canonicalTaskId: String(clickupResolution.canonicalTask.id),
+      matchCount: clickupResolution.activeMatches.length,
     }
   }
 
@@ -1169,6 +1902,7 @@ async function syncClickupTaskToBradial(taskId, options = {}) {
     const result = await bradial.upsertOpportunityContact(task, existingLead, {
       dryRun,
       controlledStageLabels,
+      preferredContactId: leadLink?.bradialContactId || null,
       preferredChatContactId: leadLink?.chatContactId || null,
       preferredConversationId: leadLink?.conversationId || null,
     })
@@ -1194,6 +1928,26 @@ async function syncClickupTaskToBradial(taskId, options = {}) {
         conversationId:
           result.conversationSync?.conversationId || leadLink?.conversationId || null,
       })
+
+      rememberOutboundBradialStageSync({
+        taskId,
+        conversationId: result.conversationSync?.conversationId || leadLink?.conversationId || null,
+        chatContactId: canonicalContactId || leadLink?.chatContactId || null,
+        label: result.stageLabel,
+      })
+
+      patchRuntimeLeadState({
+        taskId,
+        phone: normalizedPhone,
+        chatContactId: canonicalContactId || leadLink?.chatContactId || null,
+        conversationId: result.conversationSync?.conversationId || leadLink?.conversationId || null,
+        clickupStage: task.status,
+        bradialLabels: [result.stageLabel],
+      })
+
+      runtime.cache.clickup.pendingContacts = (runtime.cache.clickup.pendingContacts || []).filter(
+        (item) => String(item.taskId) !== String(taskId),
+      )
     }
 
     pushLog(
@@ -1326,6 +2080,7 @@ app.get('/health', async () => {
       inboxId: process.env.BRADIAL_INBOX_ID || null,
       opportunityLabel: BRADIAL_OPPORTUNITY_LABEL,
       chatSyncEnabled: bradial.chatEnabled,
+      contactLabelSyncEnabled: BRADIAL_SYNC_CONTACT_LABELS,
       chatBaseUrl: process.env.BRADIAL_CHAT_BASE_URL || null,
       chatAccountId: process.env.BRADIAL_CHAT_ACCOUNT_ID || process.env.BRADIAL_ACCOUNT_ID || null,
       chatInboxId: process.env.BRADIAL_CHAT_INBOX_ID || null,
@@ -1566,6 +2321,18 @@ app.post('/clickup/tasks/:taskId/sync-to-bradial', async (request, reply) => {
       }
     }
 
+    if (result.reason === 'suppressed_clickup_duplicate') {
+      return {
+        ok: true,
+        skipped: true,
+        reason: result.reason,
+        taskId,
+        phone: result.phone,
+        canonicalTaskId: result.canonicalTaskId,
+        message: 'Task duplicada suprimida automaticamente; outra task canonica do mesmo telefone foi priorizada.',
+      }
+    }
+
     if (result.reason === 'ambiguous_bradial_phone') {
       reply.code(409)
       return {
@@ -1736,6 +2503,83 @@ app.post('/webhooks/clickup/:integrationId/:webhookToken', async (request, reply
       event,
       integrationId: integration.integrationId,
     })
+  })
+
+  return reply
+})
+
+app.post('/webhooks/bradial/chatwoot', async (request, reply) => {
+  const signatureCheck = validateBradialChatWebhookRequest(request)
+  if (!signatureCheck.ok) {
+    reply.code(401)
+    return {
+      error: 'Assinatura invalida para webhook do Bradial/Chat.',
+      reason: signatureCheck.reason,
+    }
+  }
+
+  const payload = request.body || {}
+  const envelope = extractBradialWebhookEnvelope(payload)
+  const webhookKey = buildBradialWebhookKey(request, envelope, payload)
+
+  if (rememberWebhookKey(webhookKey)) {
+    return {
+      ok: true,
+      duplicate: true,
+      event: envelope.event,
+      conversationId: envelope.conversationId,
+      chatContactId: envelope.chatContactId,
+    }
+  }
+
+  reply.code(202).send({
+    ok: true,
+    accepted: true,
+    event: envelope.event,
+    conversationId: envelope.conversationId,
+    chatContactId: envelope.chatContactId,
+    signed: signatureCheck.reason !== 'unsigned',
+  })
+
+  queueMicrotask(() => {
+    void syncBradialStageToClickup(payload, {
+      trigger: `bradial-chat-webhook-${envelope.event || 'unknown'}`,
+    })
+      .then((result) => {
+        if (result?.skipped) {
+          pushLog(
+            'info',
+            'Webhook Bradial ignorado',
+            `Evento ${envelope.event || 'unknown'} ignorado: ${result.reason}.`,
+            {
+              conversationId: envelope.conversationId,
+              chatContactId: envelope.chatContactId,
+              targetLabel: result.targetLabel || null,
+            },
+          )
+        }
+      })
+      .catch((error) => {
+        pushLog(
+          'error',
+          'Falha no sync Bradial -> ClickUp',
+          error.message,
+          {
+            event: envelope.event,
+            conversationId: envelope.conversationId,
+            chatContactId: envelope.chatContactId,
+          },
+        )
+        pushSyncAudit({
+          type: 'sync_bradial_to_clickup_failed',
+          level: 'error',
+          trigger: `bradial-chat-webhook-${envelope.event || 'unknown'}`,
+          source: 'bradial-chat-webhook',
+          conversationId: envelope.conversationId,
+          chatContactId: envelope.chatContactId,
+          error: error.message,
+        })
+      })
   })
 
   return reply

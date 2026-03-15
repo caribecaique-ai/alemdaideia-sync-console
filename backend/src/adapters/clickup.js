@@ -70,7 +70,7 @@ export function createClickupAdapter(config, pushLog) {
     return candidates.filter((candidate) => candidate.token)
   }
 
-  async function request(resourcePath, token, params = {}) {
+  async function request(resourcePath, token, params = {}, init = {}) {
     const url = new URL(`${apiBaseUrl}${resourcePath}`)
     Object.entries(params).forEach(([key, value]) => {
       if (value !== undefined && value !== null && value !== '') {
@@ -78,11 +78,16 @@ export function createClickupAdapter(config, pushLog) {
       }
     })
 
+    const method = String(init.method || 'GET').toUpperCase()
+    const hasBody = init.body !== undefined
     const response = await fetch(url, {
+      method,
       headers: {
         Authorization: token,
         'Content-Type': 'application/json',
+        ...(init.headers || {}),
       },
+      body: hasBody ? JSON.stringify(init.body) : undefined,
     })
 
     if (!response.ok) {
@@ -302,6 +307,42 @@ export function createClickupAdapter(config, pushLog) {
     return mapTask(task, navigationList, navigation)
   }
 
+  async function updateTaskStatus(taskId, status, trigger = 'manual-status-update') {
+    const normalizedTaskId = String(taskId || '').trim()
+    const normalizedStatus = String(status || '').trim()
+    if (!normalizedTaskId || !normalizedStatus) {
+      throw new Error('Task e status do ClickUp sao obrigatorios para atualizar a etapa.')
+    }
+
+    const context = await resolveWorkspaceContext()
+    await resolveCommercialNavigation(context)
+
+    await request(
+      `/task/${normalizedTaskId}`,
+      context.token,
+      {},
+      {
+        method: 'PUT',
+        body: {
+          status: normalizedStatus,
+        },
+      },
+    )
+
+    pushLog(
+      'success',
+      'Status ClickUp atualizado',
+      `Task ${normalizedTaskId} movida para ${normalizedStatus}.`,
+      {
+        trigger,
+        taskId: normalizedTaskId,
+        status: normalizedStatus,
+      },
+    )
+
+    return fetchTaskById(normalizedTaskId, trigger)
+  }
+
   async function fetchSnapshot(trigger = 'manual') {
     const snapshotAt = new Date().toISOString()
     const context = await resolveWorkspaceContext()
@@ -340,5 +381,6 @@ export function createClickupAdapter(config, pushLog) {
   return {
     fetchSnapshot,
     fetchTaskById,
+    updateTaskStatus,
   }
 }

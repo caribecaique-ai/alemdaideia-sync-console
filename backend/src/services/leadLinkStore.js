@@ -56,6 +56,38 @@ export function createLeadLinkStore(config, pushLog = () => {}) {
     )
   }
 
+  function findLinkByIdentity({
+    taskId = null,
+    phone = null,
+    bradialContactId = null,
+    chatContactId = null,
+    conversationId = null,
+  } = {}) {
+    const normalizedTaskId = taskId ? String(taskId).trim() : null
+    const normalizedPhone = phone ? String(phone).trim() : null
+    const normalizedBradialContactId = bradialContactId ? String(bradialContactId).trim() : null
+    const normalizedChatContactId = chatContactId ? String(chatContactId).trim() : null
+    const normalizedConversationId = conversationId ? String(conversationId).trim() : null
+
+    return (
+      listLinks().find((item) => {
+        const itemTaskId = String(item.taskId || '').trim()
+        const itemPhone = String(item.phone || '').trim()
+        const itemBradialContactId = String(item.bradialContactId || '').trim()
+        const itemChatContactId = String(item.chatContactId || '').trim()
+        const itemConversationId = String(item.conversationId || '').trim()
+
+        return (
+          (normalizedTaskId && itemTaskId === normalizedTaskId) ||
+          (normalizedPhone && itemPhone === normalizedPhone) ||
+          (normalizedBradialContactId && itemBradialContactId === normalizedBradialContactId) ||
+          (normalizedChatContactId && itemChatContactId === normalizedChatContactId) ||
+          (normalizedConversationId && itemConversationId === normalizedConversationId)
+        )
+      }) || null
+    )
+  }
+
   function upsertLink(input = {}) {
     const normalizedTaskId = String(input.taskId || '').trim() || null
     const normalizedPhone = String(input.phone || '').trim() || null
@@ -159,6 +191,7 @@ export function createLeadLinkStore(config, pushLog = () => {}) {
     storePath,
     listLinks,
     findLink,
+    findLinkByIdentity,
     upsertLink,
     rebindContactIds,
   }

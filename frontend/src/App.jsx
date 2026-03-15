@@ -1155,6 +1155,7 @@ function App() {
               <code>GET /clickup/tasks</code>
               <code>GET /clickup/pending-contacts</code>
               <code>POST /clickup/tasks/:taskId/sync-to-bradial</code>
+              <code>POST /webhooks/bradial/chatwoot</code>
               <code>POST /refresh</code>
             </div>
           </section>

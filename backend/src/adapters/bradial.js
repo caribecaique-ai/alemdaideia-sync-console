@@ -26,6 +26,16 @@ function normalizeLabels(labels) {
   return [...unique.values()]
 }
 
+function normalizeContactRecordId(value) {
+  const raw = String(value || '').trim()
+  if (!raw) return null
+
+  const match = raw.match(/^lead-(\d+)$/)
+  if (match) return match[1]
+
+  return raw
+}
+
 function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
@@ -36,6 +46,16 @@ function toConversationLabelValue(label) {
 
 function mergeLabels(currentLabels, nextLabels = []) {
   return normalizeLabels([...(currentLabels || []), ...nextLabels])
+}
+
+function isPhoneAlreadyInUseError(error) {
+  const message = String(error?.message || '')
+  return Number(error?.statusCode || 0) === 422 && /phone number.+em uso|phone number.+in use/i.test(message)
+}
+
+function isBlankPartnerLabelError(error) {
+  const message = String(error?.message || '')
+  return Number(error?.statusCode || 0) === 422 && /title.+branco|title.+blank|title.+invalido|title.+invalid/i.test(message)
 }
 
 function extractChatwootList(data) {
@@ -90,6 +110,16 @@ function pickBestConversation(conversations, preferredInboxId = null) {
 
     return conversationActivityAt(right) - conversationActivityAt(left)
   })[0]
+}
+
+function dedupeConversations(conversations = []) {
+  const unique = new Map()
+  for (const conversation of conversations || []) {
+    const id = String(conversation?.id || '').trim()
+    if (!id) continue
+    if (!unique.has(id)) unique.set(id, conversation)
+  }
+  return [...unique.values()]
 }
 
 function conversationMatchesIdentity(conversation, { contactId, phone, name } = {}) {
@@ -172,9 +202,11 @@ export function createBradialAdapter(config, pushLog) {
   const configuredStageLabelMap = config.stageLabelMap || null
   const chatEnabled = Boolean(chatBaseUrl && chatApiToken && chatAccountId)
   const syncConversationLabels = config.syncConversationLabels !== false
+  const syncContactLabels = config.syncContactLabels === true
   const requestMaxAttempts = Math.max(1, Number(config.requestMaxAttempts || 3))
   const requestRetryBaseMs = Math.max(50, Number(config.requestRetryBaseMs || 150))
   const conversationSearchPages = Math.max(3, Number(config.conversationSearchPages || 8))
+  const contactSearchPages = Math.max(maxPages, Number(config.contactSearchPages || 20))
   const labelVerifyAttempts = Math.max(1, Number(config.labelVerifyAttempts || 2))
   const labelVerifyDelayMs = Math.max(25, Number(config.labelVerifyDelayMs || 75))
   let chatLabelCatalogCache = null
@@ -283,10 +315,10 @@ export function createBradialAdapter(config, pushLog) {
     }
   }
 
-  async function listPaged(path) {
+  async function listPaged(path, pageLimit = maxPages) {
     const rows = []
 
-    for (let page = 1; page <= maxPages; page += 1) {
+    for (let page = 1; page <= pageLimit; page += 1) {
       const payload = await request(path, { params: { page } })
       const data = Array.isArray(payload?.data) ? payload.data : []
       if (!data.length) break
@@ -298,6 +330,7 @@ export function createBradialAdapter(config, pushLog) {
   }
 
   function buildContactPayload(task, existingLead = null, options = {}) {
+    const includeLabels = options.includeLabels !== false
     const targetStageLabel =
       String(
         options.targetStageLabel || resolveBradialStageLabel(task?.status, configuredStageLabelMap) || '',
@@ -317,12 +350,15 @@ export function createBradialAdapter(config, pushLog) {
         String(task?.email || existingLead?.email || existingLead?.raw?.bradialEmail || '').trim() ||
         undefined,
       phoneNumber: normalizePhone(task?.phone || existingLead?.phone),
-      labels,
+    }
+
+    if (includeLabels) {
+      payload.labels = labels
     }
 
     return Object.fromEntries(
       Object.entries(payload).filter(([, value]) => {
-        if (Array.isArray(value)) return value.length > 0
+        if (Array.isArray(value)) return true
         return value !== undefined && value !== null && value !== ''
       }),
     )
@@ -371,16 +407,55 @@ export function createBradialAdapter(config, pushLog) {
   }
 
   function isSamePayload(existingLead, payload) {
+    const compareLabels = Array.isArray(payload?.labels)
     return (
       normalizeText(existingLead?.name) === normalizeText(payload.name) &&
       normalizeText(existingLead?.email || existingLead?.raw?.bradialEmail) === normalizeText(payload.email) &&
       normalizePhone(existingLead?.phone) === normalizePhone(payload.phoneNumber) &&
-      labelsEqual(existingLead?.bradialLabels || existingLead?.raw?.bradialLabels, payload.labels)
+      (!compareLabels ||
+        labelsEqual(existingLead?.bradialLabels || existingLead?.raw?.bradialLabels, payload.labels))
     )
   }
 
   async function fetchContact(contactId) {
     return request(`/v2/public-api/v1/contacts/${contactId}`)
+  }
+
+  function resolvePartnerContactId(contact, fallbackContact = null) {
+    return normalizeContactRecordId(
+      contact?.raw?.bradialContactId ||
+        contact?.id ||
+        contact?.chatContactId ||
+        fallbackContact?.raw?.bradialContactId ||
+        fallbackContact?.id ||
+        fallbackContact?.chatContactId ||
+        null,
+    )
+  }
+
+  async function clearPartnerContactLabels(contactId) {
+    const currentContact = await fetchContact(contactId)
+    if (!normalizeLabels(currentContact?.labels).length) {
+      return currentContact
+    }
+
+    try {
+      await request(`/v2/public-api/v1/contacts/${contactId}`, {
+        method: 'PATCH',
+        body: { labels: [''] },
+      })
+    } catch (error) {
+      if (!isBlankPartnerLabelError(error)) {
+        throw error
+      }
+    }
+
+    const verifiedContact = await fetchContact(contactId)
+    if (normalizeLabels(verifiedContact?.labels).length) {
+      throw new Error(`Contato Bradial ${contactId} nao convergiu para limpeza das etiquetas do contato.`)
+    }
+
+    return verifiedContact
   }
 
   async function fetchContactSafely(contactId) {
@@ -393,6 +468,20 @@ export function createBradialAdapter(config, pushLog) {
 
       throw error
     }
+  }
+
+  async function hydrateContactFromId(contactId, expectedPhone = null) {
+    const normalizedId = String(contactId || '').trim()
+    if (!normalizedId) return null
+
+    const contact = await fetchContactSafely(normalizedId)
+    if (!contact?.id) return null
+
+    if (expectedPhone && !phonesMatchLoose(contact.phoneNumber || contact.phone_number, expectedPhone)) {
+      return null
+    }
+
+    return contact
   }
 
   async function fetchChatContact(contactId) {
@@ -684,8 +773,7 @@ export function createBradialAdapter(config, pushLog) {
           },
         }
       : null
-    const conversation =
-      preferredConversation ||
+    const discoveredConversation =
       fallbackConversation ||
       pickBestConversation(conversations, chatInboxId) ||
       (await findConversationByIdentity({
@@ -693,6 +781,10 @@ export function createBradialAdapter(config, pushLog) {
         phone,
         name,
       }))
+    const knownConversations = dedupeConversations(
+      [preferredConversation, discoveredConversation, ...(conversations || [])].filter(Boolean),
+    )
+    const conversation = preferredConversation || discoveredConversation || knownConversations[0] || null
     const effectiveChatContactId = String(
       chatContact?.id || conversation?.meta?.sender?.id || preferredChatContactId || contactId,
     )
@@ -704,34 +796,50 @@ export function createBradialAdapter(config, pushLog) {
     )
     const targetAccountLabel = await resolveAccountLabelTitle(targetStageLabel || opportunityLabel)
     const targetConversationLabel = toConversationLabelValue(targetAccountLabel)
-    const currentChatContactLabels = await listChatContactLabels(effectiveChatContactId)
-    const nextChatContactLabels = mergeLabels(
-      stripControlledStageLabels(currentChatContactLabels, controlledChatStageLabels),
-      [targetConversationLabel].filter(Boolean),
-    )
+    const currentChatContactLabels = effectiveChatContactId
+      ? await listChatContactLabels(effectiveChatContactId).catch(() => [])
+      : []
+    const nextChatContactLabels = syncContactLabels
+      ? mergeLabels(
+          stripControlledStageLabels(currentChatContactLabels, controlledChatStageLabels),
+          [targetConversationLabel].filter(Boolean),
+        )
+      : []
 
-    let contactLabelOperation = 'noop'
+    let contactLabelOperation = syncContactLabels
+      ? 'noop'
+      : effectiveChatContactId
+        ? 'clear'
+        : 'disabled'
     let syncedChatContactLabels = currentChatContactLabels
 
-    const contactLabelsChanged = !labelsEqual(currentChatContactLabels, nextChatContactLabels)
+    const contactLabelsChanged = syncContactLabels
+      ? !labelsEqual(currentChatContactLabels, nextChatContactLabels)
+      : Boolean(effectiveChatContactId)
 
     if (contactLabelsChanged) {
-      contactLabelOperation = 'update'
-      syncedChatContactLabels = dryRun ? nextChatContactLabels : currentChatContactLabels
+      contactLabelOperation = syncContactLabels ? 'update' : 'clear'
+      syncedChatContactLabels = dryRun
+        ? nextChatContactLabels
+        : syncContactLabels
+          ? currentChatContactLabels
+          : []
     }
 
-    const syncChatContactLabelsOnly = async () => {
-      if (!contactLabelsChanged || dryRun) {
+    const applyChatContactLabelState = async () => {
+      if (!contactLabelsChanged || dryRun || !effectiveChatContactId) {
         return syncedChatContactLabels
       }
 
+      const expectedLabels = syncContactLabels ? nextChatContactLabels : []
+
       return applyAndVerifyLabelSet({
         shouldUpdate: true,
-        update: () => updateChatContactLabels(effectiveChatContactId, nextChatContactLabels),
+        update: () => updateChatContactLabels(effectiveChatContactId, expectedLabels),
         verify: () =>
           verifyLabels({
             fetchLabels: () => listChatContactLabels(effectiveChatContactId),
-            expectedLabels: nextChatContactLabels,
+            expectedLabels,
             kind: `Etiquetas do contato do chat ${effectiveChatContactId}`,
           }),
         fallback: syncedChatContactLabels,
@@ -739,11 +847,12 @@ export function createBradialAdapter(config, pushLog) {
     }
 
     if (!syncConversationLabels) {
-      syncedChatContactLabels = await syncChatContactLabelsOnly()
+      syncedChatContactLabels = await applyChatContactLabelState()
       return {
         enabled: true,
-        skipped: false,
-        operation: contactLabelOperation === 'update' ? 'update' : 'noop',
+        skipped: contactLabelOperation === 'noop' || contactLabelOperation === 'disabled',
+        operation:
+          contactLabelOperation === 'update' || contactLabelOperation === 'clear' ? 'update' : 'noop',
         conversationId: conversation?.id ? String(conversation.id) : null,
         chatContactId: effectiveChatContactId,
         labels: conversation?.labels ? normalizeLabels(conversation.labels) : [],
@@ -754,13 +863,14 @@ export function createBradialAdapter(config, pushLog) {
     }
 
     if (!conversation?.id) {
-      syncedChatContactLabels = await syncChatContactLabelsOnly()
+      syncedChatContactLabels = await applyChatContactLabelState()
       return {
         enabled: true,
-        skipped: contactLabelOperation === 'noop',
+        skipped: true,
         reason: 'conversation_not_found',
-        operation: contactLabelOperation === 'update' ? 'update' : 'noop',
+        operation: 'noop',
         conversationId: null,
+        knownConversationId: preferredConversationId ? String(preferredConversationId) : null,
         chatContactId: effectiveChatContactId,
         labels: [],
         contactLabels: syncedChatContactLabels,
@@ -769,24 +879,38 @@ export function createBradialAdapter(config, pushLog) {
       }
     }
 
-    const currentLabels = Array.isArray(conversation.labels) && conversation.labels.length
-      ? normalizeLabels(conversation.labels)
-      : await listConversationLabels(conversation.id)
-    const nextLabels = mergeLabels(
-      stripControlledStageLabels(currentLabels, controlledChatStageLabels),
-      [targetConversationLabel].filter(Boolean),
+    const conversationPlans = await Promise.all(
+      knownConversations.map(async (item) => {
+        const currentLabels = Array.isArray(item.labels) && item.labels.length
+          ? normalizeLabels(item.labels)
+          : await listConversationLabels(item.id)
+        const nextLabels = mergeLabels(
+          stripControlledStageLabels(currentLabels, controlledChatStageLabels),
+          [targetConversationLabel].filter(Boolean),
+        )
+
+        return {
+          id: String(item.id),
+          currentLabels,
+          nextLabels,
+          labelsChanged: !labelsEqual(currentLabels, nextLabels),
+        }
+      }),
     )
+    const primaryPlan =
+      conversationPlans.find((plan) => String(plan.id) === String(conversation.id)) ||
+      conversationPlans[0]
+    const conversationLabelsChanged = conversationPlans.some((plan) => plan.labelsChanged)
 
-    const conversationLabelsChanged = !labelsEqual(currentLabels, nextLabels)
-
-    if (!conversationLabelsChanged && contactLabelOperation === 'noop') {
+    if (!conversationLabelsChanged && (contactLabelOperation === 'noop' || contactLabelOperation === 'disabled')) {
       return {
         enabled: true,
         skipped: false,
         operation: 'noop',
-        conversationId: String(conversation.id),
+        conversationId: String(primaryPlan.id),
+        knownConversationId: preferredConversationId ? String(preferredConversationId) : null,
         chatContactId: effectiveChatContactId,
-        labels: nextLabels,
+        labels: primaryPlan.nextLabels,
         contactLabels: syncedChatContactLabels,
         contactLabelOperation,
         conversationLabelOperation: 'noop',
@@ -799,9 +923,10 @@ export function createBradialAdapter(config, pushLog) {
         skipped: false,
         operation: 'update',
         dryRun: true,
-        conversationId: String(conversation.id),
+        conversationId: String(primaryPlan.id),
+        knownConversationId: preferredConversationId ? String(preferredConversationId) : null,
         chatContactId: effectiveChatContactId,
-        labels: nextLabels,
+        labels: primaryPlan.nextLabels,
         contactLabels: syncedChatContactLabels,
         contactLabelOperation,
         conversationLabelOperation: conversationLabelsChanged ? 'update' : 'noop',
@@ -809,35 +934,44 @@ export function createBradialAdapter(config, pushLog) {
     }
 
     const [verifiedChatContactLabels, verifiedConversationLabels] = await Promise.all([
-      applyAndVerifyLabelSet({
-        shouldUpdate: contactLabelsChanged,
-        update: () => updateChatContactLabels(effectiveChatContactId, nextChatContactLabels),
-        verify: () =>
-          verifyLabels({
-            fetchLabels: () => listChatContactLabels(effectiveChatContactId),
-            expectedLabels: nextChatContactLabels,
-            kind: `Etiquetas do contato do chat ${effectiveChatContactId}`,
-          }),
-        fallback: syncedChatContactLabels,
-      }),
+      applyChatContactLabelState(),
       applyAndVerifyLabelSet({
         shouldUpdate: conversationLabelsChanged,
-        update: () => updateConversationLabels(conversation.id, nextLabels),
-        verify: () =>
-          verifyLabels({
-            fetchLabels: () => listConversationLabels(conversation.id),
-            expectedLabels: nextLabels,
-            kind: `Etiquetas da conversa ${conversation.id}`,
-          }),
-        fallback: currentLabels,
+        update: async () => {
+          for (const plan of conversationPlans) {
+            if (!plan.labelsChanged) continue
+            await updateConversationLabels(plan.id, plan.nextLabels)
+          }
+        },
+        verify: async () => {
+          let verifiedPrimaryLabels = primaryPlan.currentLabels
+          for (const plan of conversationPlans) {
+            const verifiedLabels = await verifyLabels({
+              fetchLabels: () => listConversationLabels(plan.id),
+              expectedLabels: plan.nextLabels,
+              kind: `Etiquetas da conversa ${plan.id}`,
+            })
+            if (String(plan.id) === String(primaryPlan.id)) {
+              verifiedPrimaryLabels = verifiedLabels
+            }
+          }
+          return verifiedPrimaryLabels
+        },
+        fallback: primaryPlan.currentLabels,
       }),
     ])
 
     return {
       enabled: true,
       skipped: false,
-      operation: contactLabelOperation === 'update' || conversationLabelsChanged ? 'update' : 'noop',
-      conversationId: String(conversation.id),
+      operation:
+        contactLabelOperation === 'update' ||
+        contactLabelOperation === 'clear' ||
+        conversationLabelsChanged
+          ? 'update'
+          : 'noop',
+      conversationId: String(primaryPlan.id),
+      knownConversationId: preferredConversationId ? String(preferredConversationId) : null,
       chatContactId: effectiveChatContactId,
       labels: verifiedConversationLabels,
       contactLabels: verifiedChatContactLabels,
@@ -887,12 +1021,12 @@ export function createBradialAdapter(config, pushLog) {
   async function hydrateContactFromPhone(
     phone,
     preferredContactId = null,
-    { canonicalName = null, canonicalEmail = null } = {},
+    { canonicalName = null, canonicalEmail = null, pageLimit = maxPages } = {},
   ) {
     const normalizedPhone = normalizePhone(phone)
     if (!normalizedPhone) return null
 
-    const contacts = await listPaged('/v2/public-api/v1/contacts')
+    const contacts = await listPaged('/v2/public-api/v1/contacts', pageLimit)
     const looseMatches = contacts.filter(
       (contact) => phonesMatchLoose(contact.phoneNumber || contact.phone_number, normalizedPhone),
     )
@@ -921,7 +1055,8 @@ export function createBradialAdapter(config, pushLog) {
       })
     }
 
-    const refreshedMatches = matches.length > 1 ? await listPaged('/v2/public-api/v1/contacts') : contacts
+    const refreshedMatches =
+      matches.length > 1 ? await listPaged('/v2/public-api/v1/contacts', pageLimit) : contacts
     const remaining = (
       await Promise.all(
         refreshedMatches
@@ -947,11 +1082,17 @@ export function createBradialAdapter(config, pushLog) {
         options.targetStageLabel || resolveBradialStageLabel(task?.status, configuredStageLabelMap) || '',
       ).trim() || null
     const payload = buildContactPayload(task, existingLead, {
+      includeLabels: false,
       targetStageLabel,
       controlledStageLabels: options.controlledStageLabels,
     })
-    payload.labels = await Promise.all(
-      (payload.labels || []).map((label) => resolveAccountLabelTitle(label)),
+    const createPayload = buildContactPayload(task, existingLead, {
+      includeLabels: true,
+      targetStageLabel,
+      controlledStageLabels: options.controlledStageLabels,
+    })
+    createPayload.labels = await Promise.all(
+      (createPayload.labels || []).map((label) => resolveAccountLabelTitle(label)),
     )
     const previousStageLabels = pickControlledLabels(
       existingLead?.bradialLabels || existingLead?.raw?.bradialLabels || [],
@@ -964,14 +1105,42 @@ export function createBradialAdapter(config, pushLog) {
 
     let contactOperation = 'noop'
     let resolvedContact = existingLead
+    const preferredContactId =
+      String(
+        options.preferredContactId ||
+          existingLead?.raw?.bradialContactId ||
+          existingLead?.chatContactId ||
+          '',
+      ).trim() || null
+
+    if (!resolvedContact?.chatContactId && preferredContactId) {
+      const hydratedById = await hydrateContactFromId(preferredContactId, payload.phoneNumber)
+      if (hydratedById?.id) {
+        resolvedContact = {
+          ...(existingLead || {}),
+          ...toLead(hydratedById, new Date().toISOString()),
+          raw: {
+            ...(existingLead?.raw || {}),
+            bradialContactId: String(hydratedById.id),
+            bradialLabels: normalizeLabels(hydratedById.labels),
+            bradialEmail: hydratedById.email ? String(hydratedById.email).trim() : null,
+          },
+          chatContactId: String(hydratedById.id),
+          bradialLabels: normalizeLabels(hydratedById.labels),
+          email: hydratedById.email ? String(hydratedById.email).trim() : existingLead?.email || null,
+          phone: normalizePhone(hydratedById.phoneNumber || hydratedById.phone_number || payload.phoneNumber),
+        }
+      }
+    }
 
     if (!resolvedContact?.chatContactId && payload.phoneNumber) {
       const hydratedExisting = await hydrateContactFromPhone(
         payload.phoneNumber,
-        options.preferredContactId || null,
+        preferredContactId,
         {
           canonicalName: payload.name || task?.name || existingLead?.name || null,
           canonicalEmail: payload.email || existingLead?.email || null,
+          pageLimit: contactSearchPages,
         },
       )
 
@@ -1012,37 +1181,79 @@ export function createBradialAdapter(config, pushLog) {
       }
       contactOperation = 'update'
     } else {
-      const created = await request('/v2/public-api/v1/contacts', {
-        method: 'POST',
-        body: payload,
-      })
-      resolvedContact =
-        (created && typeof created === 'object' && created.id ? created : null) ||
-        (await hydrateContactFromPhone(payload.phoneNumber, null, {
-          canonicalName: payload.name || task?.name || existingLead?.name || null,
-          canonicalEmail: payload.email || existingLead?.email || null,
-        }))
-      if (!resolvedContact) {
-        throw new Error(`Contato Bradial nao foi localizado apos create para ${payload.phoneNumber}.`)
+      try {
+        const created = await request('/v2/public-api/v1/contacts', {
+          method: 'POST',
+          body: createPayload,
+        })
+        resolvedContact =
+          (created && typeof created === 'object' && created.id ? created : null) ||
+          (await hydrateContactFromPhone(payload.phoneNumber, preferredContactId, {
+            canonicalName: payload.name || task?.name || existingLead?.name || null,
+            canonicalEmail: payload.email || existingLead?.email || null,
+            pageLimit: contactSearchPages,
+          }))
+        if (!resolvedContact) {
+          throw new Error(`Contato Bradial nao foi localizado apos create para ${payload.phoneNumber}.`)
+        }
+        contactOperation = 'create'
+      } catch (error) {
+        if (!isPhoneAlreadyInUseError(error)) {
+          throw error
+        }
+
+        const recoveredContact =
+          (await hydrateContactFromId(preferredContactId, payload.phoneNumber)) ||
+          (await hydrateContactFromPhone(payload.phoneNumber, preferredContactId, {
+            canonicalName: payload.name || task?.name || existingLead?.name || null,
+            canonicalEmail: payload.email || existingLead?.email || null,
+            pageLimit: contactSearchPages,
+          }))
+
+        if (!recoveredContact?.id) {
+          throw error
+        }
+
+        if (isSamePayload(toLead(recoveredContact, new Date().toISOString()), payload)) {
+          resolvedContact = recoveredContact
+          contactOperation = 'noop'
+        } else {
+          await request(`/v2/public-api/v1/contacts/${recoveredContact.id}`, {
+            method: 'PATCH',
+            body: payload,
+          })
+
+          resolvedContact =
+            (await fetchContact(recoveredContact.id).catch(() => null)) ||
+            (await hydrateContactFromId(recoveredContact.id, payload.phoneNumber)) ||
+            recoveredContact
+
+          contactOperation = 'update'
+        }
       }
-      contactOperation = 'create'
     }
 
-    if (!dryRun && resolvedContact?.id && contactOperation !== 'noop') {
-      const verifiedContact = await fetchContact(resolvedContact.id)
+    const resolvedPartnerContactId = resolvePartnerContactId(resolvedContact, existingLead)
+
+    if (!dryRun && resolvedPartnerContactId && contactOperation !== 'noop') {
+      const verifiedContact = await fetchContact(resolvedPartnerContactId)
       const verifiedLabels = normalizeLabels(verifiedContact?.labels)
-      if (!labelsEqual(verifiedLabels, payload.labels || [])) {
+      if (contactOperation === 'create' && !labelsEqual(verifiedLabels, createPayload.labels || [])) {
         throw new Error(
-          `Contato Bradial ${resolvedContact.id} nao convergiu para as etiquetas esperadas.`,
+          `Contato Bradial ${resolvedPartnerContactId} nao convergiu para as etiquetas esperadas.`,
         )
       }
       resolvedContact = verifiedContact
     }
 
+    if (!dryRun && resolvedPartnerContactId && !syncContactLabels) {
+      resolvedContact = await clearPartnerContactLabels(resolvedPartnerContactId)
+    }
+
     let consolidatedChatContact = null
-    if (!dryRun && resolvedContact?.id) {
+    if (!dryRun && resolvedPartnerContactId) {
       consolidatedChatContact = await ensureSingleChatContact({
-        baseContactId: resolvedContact.id,
+        baseContactId: resolvedPartnerContactId,
         phone: payload.phoneNumber,
         name: payload.name || task?.name || existingLead?.name || null,
         email: payload.email || null,
@@ -1050,7 +1261,7 @@ export function createBradialAdapter(config, pushLog) {
         pushLog('warning', 'Falha ao consolidar contato duplicado no chat', error.message, {
           taskName: task?.name || null,
           phone: payload.phoneNumber,
-          contactId: resolvedContact?.id || null,
+          contactId: resolvedPartnerContactId || null,
         })
         return null
       })
@@ -1065,7 +1276,7 @@ export function createBradialAdapter(config, pushLog) {
     try {
       conversationSync = await syncConversationStageLabels({
         contactId:
-          resolvedContact?.id ||
+          resolvedPartnerContactId ||
           resolvedContact?.chatContactId ||
           existingLead?.chatContactId ||
           null,
@@ -1092,7 +1303,11 @@ export function createBradialAdapter(config, pushLog) {
         {
           taskName: task?.name || null,
           phone: payload.phoneNumber,
-          chatContactId: resolvedContact?.id || resolvedContact?.chatContactId || existingLead?.chatContactId || null,
+          chatContactId:
+            resolvedPartnerContactId ||
+            resolvedContact?.chatContactId ||
+            existingLead?.chatContactId ||
+            null,
         },
       )
     }
@@ -1140,9 +1355,31 @@ export function createBradialAdapter(config, pushLog) {
     }
   }
 
+  async function hydrateContactsByIds(contactIds = [], snapshotAt = new Date().toISOString()) {
+    const normalizedIds = [...new Set((contactIds || []).map((item) => String(item || '').trim()).filter(Boolean))]
+    if (!normalizedIds.length) {
+      return {
+        contacts: [],
+        leads: [],
+      }
+    }
+
+    const contacts = (
+      await Promise.all(normalizedIds.map((contactId) => fetchContactSafely(contactId)))
+    ).filter(Boolean)
+
+    return {
+      contacts,
+      leads: contacts.map((contact) => toLead(contact, snapshotAt)),
+    }
+  }
+
   return {
     fetchSnapshot,
+    hydrateContactsByIds,
     upsertOpportunityContact,
+    fetchConversationLabels: listConversationLabels,
+    fetchChatContactLabels: listChatContactLabels,
     opportunityLabel,
     chatEnabled,
   }

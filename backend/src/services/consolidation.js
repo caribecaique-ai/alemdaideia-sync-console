@@ -1,4 +1,5 @@
 import { normalizePhone, normalizePhoneLooseKey } from '../utils/normalizers.js'
+import { isActiveClickupTask, resolveClickupPhoneConflict } from './clickupTaskResolution.js'
 import {
   labelsIncludeEquivalent,
   pickControlledLabels,
@@ -49,7 +50,8 @@ function buildClickupExceptions(taskIndex, snapshotAt) {
   const exceptions = []
 
   for (const [phone, tasks] of taskIndex.entries()) {
-    if (!phone || tasks.length <= 1) continue
+    const resolution = resolveClickupPhoneConflict(tasks, phone)
+    if (!phone || !resolution.ambiguous) continue
     exceptions.push({
       id: `duplicate-clickup-phone-${phone}`,
       status: 'open',
@@ -336,14 +338,23 @@ function buildPendingClickupContacts(
   }
 
   return (clickupSnapshot?.tasks || [])
-    .filter((task) => {
-      if (!normalizePhone(task.phone)) return false
-      const statusType = String(task.statusType || '').toLowerCase()
-      return statusType !== 'done' && statusType !== 'closed'
-    })
+    .filter((task) => normalizePhone(task.phone) && isActiveClickupTask(task))
     .map((task) => {
       const phone = normalizePhone(task.phone)
       const clickupMatches = phone ? taskIndex.get(phone) || [] : []
+      const clickupResolution = resolveClickupPhoneConflict(clickupMatches, phone)
+      const activeClickupMatches = clickupResolution.activeMatches || []
+      const canonicalTaskId = String(clickupResolution.canonicalTask?.id || '')
+
+      if (
+        !clickupResolution.ambiguous &&
+        activeClickupMatches.length > 1 &&
+        canonicalTaskId &&
+        canonicalTaskId !== String(task.id)
+      ) {
+        return null
+      }
+
       const bradialMatches = phone ? rawBradialIndex.get(phone) || [] : []
       const matchedLead = phone ? (bradialIndex.get(phone) || [])[0] || null : null
       const targetStageLabel = resolveBradialStageLabel(task.status, stageLabelMap)
@@ -359,9 +370,9 @@ function buildPendingClickupContacts(
       let syncAllowed = false
       let summary = ''
 
-      if (clickupMatches.length > 1) {
+      if (clickupResolution.ambiguous) {
         syncState = 'ambiguous_clickup_phone'
-        summary = `Telefone usado em ${clickupMatches.length} tasks do ClickUp.`
+        summary = `Telefone usado em ${activeClickupMatches.length} tasks ativas do ClickUp.`
       } else if (bradialMatches.length > 1) {
         syncState = 'ambiguous_bradial_phone'
         summary = `Telefone usado em ${bradialMatches.length} contatos da Bradial.`
@@ -398,7 +409,7 @@ function buildPendingClickupContacts(
         currentControlledLabels,
         targetStageLabel,
         bradialMatchCount: bradialMatches.length,
-        clickupMatchCount: clickupMatches.length,
+        clickupMatchCount: activeClickupMatches.length,
         syncState,
         syncAllowed,
         summary,

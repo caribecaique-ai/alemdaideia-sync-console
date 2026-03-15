@@ -18,6 +18,7 @@ Projeto local para consolidar dados da Bradial com o ClickUp do workspace `Alem 
 - lista tasks do ClickUp que ainda precisam virar contato no Bradial
 - cria ou atualiza contato no Bradial sem enviar mensagem
 - espelha a etapa do ClickUp em uma tag controlada no Bradial, removendo a tag de etapa anterior
+- permite sync reverso de etapa via webhook do Bradial/Chat para atualizar o status no ClickUp
 - gera URL por integracao para cadastro de webhook no ClickUp
 
 ## Seguranca
@@ -49,6 +50,7 @@ Variaveis principais:
 - `BRADIAL_CHAT_ACCOUNT_ID`
 - `BRADIAL_CHAT_API_TOKEN`
 - `BRADIAL_CHAT_INBOX_ID`
+- `BRADIAL_CHAT_WEBHOOK_SECRET`
 - `BRADIAL_OPPORTUNITY_LABEL`
 - `PUBLIC_BASE_URL`
 - `CLICKUP_API_KEY`
@@ -70,6 +72,37 @@ Opcionalmente, em vez de `CLICKUP_API_KEY`, o backend pode usar:
 cd frontend
 npm install
 npm run dev
+```
+
+## Modo Local Blindado
+
+Para manter o stack local de pe enquanto a maquina estiver ligada:
+
+```powershell
+cd ops
+.\Start-LocalStackSupervisor.ps1
+```
+
+O supervisor:
+
+- mantem backend na porta `3015`
+- mantem frontend na porta `4180`
+- mantem o `ngrok` apontando para `3015`
+- reinicia automaticamente backend, frontend ou tunnel se cair
+- valida a URL publica esperada antes de considerar o stack saudavel
+
+Para parar o supervisor:
+
+```powershell
+cd ops
+.\Stop-LocalStackSupervisor.ps1
+```
+
+Para parar tambem backend, frontend e ngrok:
+
+```powershell
+cd ops
+.\Stop-LocalStackSupervisor.ps1 -StopServices
 ```
 
 ## Portas padrao
@@ -95,4 +128,5 @@ npm run dev
 - `POST /clickup/tasks/:taskId/sync-to-bradial`
 - `POST /webhooks/clickup`
 - `POST /webhooks/clickup/:integrationId/:webhookToken`
+- `POST /webhooks/bradial/chatwoot`
 - `POST /refresh`
