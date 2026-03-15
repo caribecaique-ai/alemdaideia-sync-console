@@ -1,0 +1,31 @@
+name: Deploy Hostinger VPS
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'backend/**'
+      - 'frontend/**'
+      - 'ops/**'
+      - 'ecosystem.config.cjs'
+      - 'DEPLOY_HOSTINGER.md'
+      - 'README.md'
+      - '.github/workflows/deploy-hostinger.yml'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.HOSTINGER_HOST }}
+          username: ${{ secrets.HOSTINGER_USER }}
+          key: ${{ secrets.HOSTINGER_SSH_KEY }}
+          port: ${{ secrets.HOSTINGER_PORT || 22 }}
+          script: |
+            export APP_DIR="${{ secrets.HOSTINGER_APP_DIR }}"
+            export BRANCH="main"
+            bash "${APP_DIR}/ops/deploy-hostinger.sh"
