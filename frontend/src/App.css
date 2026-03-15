@@ -20,7 +20,7 @@
 .background-orbit-left {
   top: -8rem;
   left: -10rem;
-  background: radial-gradient(circle, rgba(246, 188, 66, 0.9) 0%, rgba(246, 188, 66, 0) 70%);
+  background: radial-gradient(circle, rgba(45, 170, 225, 0.45) 0%, rgba(45, 170, 225, 0) 70%);
 }
 
 .background-orbit-right {
@@ -49,13 +49,29 @@
   border-radius: 2rem;
   overflow: hidden;
 }
+.hero-brand {
+  display: flex;
+  gap: 1.5rem;
+  align-items: center;
+}
+
+.brand-logo {
+  width: 90px;
+  height: 90px;
+  object-fit: contain;
+  filter: drop-shadow(0 0 10px rgba(45, 170, 225, 0.3));
+}
+
+.brand-text {
+  display: grid;
+}
 
 .hero-bar::after {
   content: '';
   position: absolute;
   inset: 0;
   background:
-    linear-gradient(135deg, rgba(246, 188, 66, 0.14), transparent 42%),
+    linear-gradient(135deg, rgba(45, 170, 225, 0.22), transparent 42%),
     linear-gradient(315deg, rgba(88, 205, 255, 0.12), transparent 40%);
   pointer-events: none;
 }
@@ -201,7 +217,7 @@
 .form-grid input:focus,
 .form-grid select:focus,
 .search-input:focus {
-  border-color: rgba(246, 188, 66, 0.55);
+  border-color: rgba(45, 170, 225, 0.55);
   transform: translateY(-1px);
 }
 
@@ -218,7 +234,7 @@
 button {
   border: none;
   border-radius: 999px;
-  background: linear-gradient(135deg, #f6bc42, #f07d33);
+  background: linear-gradient(135deg, #2daae1, #1b88ba);
   color: #101316;
   font-weight: 700;
   padding: 0.82rem 1.1rem;
@@ -466,8 +482,8 @@ button:disabled {
 }
 
 .lead-list-item.selected {
-  border-color: rgba(246, 188, 66, 0.45);
-  box-shadow: inset 0 0 0 1px rgba(246, 188, 66, 0.18);
+  border-color: rgba(45, 170, 225, 0.45);
+  box-shadow: inset 0 0 0 1px rgba(45, 170, 225, 0.18);
 }
 
 .lead-list-item small {

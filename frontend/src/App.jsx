@@ -937,13 +937,16 @@ function App() {
       <div className="background-orbit background-orbit-right" />
 
       <header className="hero-bar panel">
-        <div>
-          <p className="eyebrow">Painel operacional</p>
-          <h1>Bradial x ClickUp Sync Console</h1>
-          <p className="hero-copy">
-            Controle a leitura real de Bradial e ClickUp, acompanhe excecoes de identificacao
-            e cadastre oportunidades no Bradial sem disparar mensagens automaticas.
-          </p>
+        <div className="hero-brand">
+          <img src="/logo.png" alt="OneClick Logo" className="brand-logo" />
+          <div className="brand-text">
+            <p className="eyebrow">Painel operacional</p>
+            <h1>OneClick Sync Console</h1>
+            <p className="hero-copy">
+              Central de inteligência para sincronização inteligente entre Bradial e ClickUp.
+              Gerencie leads, resolva exceções e economize cliques com automação de ponta.
+            </p>
+          </div>
         </div>
 
         <div className="hero-actions">
