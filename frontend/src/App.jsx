@@ -45,6 +45,42 @@ function usePersistentState(key, fallback) {
   return [state, setState]
 }
 
+function normalizeBackendUrl(value) {
+  return String(value || '').trim().replace(/\/$/, '')
+}
+
+function buildBackendHeaders(config, extraHeaders = {}) {
+  const headers = new Headers(extraHeaders)
+  const adminApiToken = String(config?.adminApiToken || '').trim()
+
+  if (adminApiToken) {
+    headers.set('Authorization', `Bearer ${adminApiToken}`)
+  }
+
+  return headers
+}
+
+function fetchBackend(config, path, options = {}) {
+  const backendUrl = normalizeBackendUrl(config?.backendUrl)
+  const requestPath = String(path || '').startsWith('/') ? path : `/${path}`
+  return fetch(`${backendUrl}${requestPath}`, {
+    ...options,
+    headers: buildBackendHeaders(config, options.headers),
+  })
+}
+
+function buildEventStreamUrl(config) {
+  const backendUrl = normalizeBackendUrl(config?.backendUrl)
+  const url = new URL(`${backendUrl}/events`)
+  const adminApiToken = String(config?.adminApiToken || '').trim()
+
+  if (adminApiToken) {
+    url.searchParams.set('adminToken', adminApiToken)
+  }
+
+  return url.toString()
+}
+
 function formatDate(value) {
   if (!value) return 'sem registro'
 
@@ -67,6 +103,319 @@ function createLog(level, title, message, leadId = null) {
     leadId,
     createdAt: new Date().toISOString(),
   }
+}
+
+function toEventTimestamp(value) {
+  if (!value) return 0
+  const parsed = Date.parse(value)
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+function mergeRecentEntries(current = [], incoming = [], limit = 160) {
+  const map = new Map()
+
+  for (const item of [...incoming, ...current]) {
+    if (!item?.id || map.has(item.id)) continue
+    map.set(item.id, item)
+  }
+
+  return [...map.values()]
+    .sort((left, right) => toEventTimestamp(right.createdAt || right.sentAt) - toEventTimestamp(left.createdAt || left.sentAt))
+    .slice(0, limit)
+}
+
+function buildActivityLookup(leads = [], pendingContacts = []) {
+  const byTaskId = new Map()
+  const byPhone = new Map()
+  const byConversationId = new Map()
+  const byContactId = new Map()
+
+  const register = (map, key, value) => {
+    const normalizedKey = String(key || '').trim()
+    const normalizedValue = String(value || '').trim()
+    if (!normalizedKey || !normalizedValue || map.has(normalizedKey)) return
+    map.set(normalizedKey, normalizedValue)
+  }
+
+  for (const lead of Array.isArray(leads) ? leads : []) {
+    register(byTaskId, lead?.clickupTaskId, lead?.name)
+    register(byPhone, normalizeLeadPhone(lead?.phone), lead?.name)
+    register(byConversationId, lead?.conversationId || lead?.chatConversationId, lead?.name)
+    register(byContactId, lead?.raw?.bradialContactId || lead?.chatContactId, lead?.name)
+  }
+
+  for (const item of Array.isArray(pendingContacts) ? pendingContacts : []) {
+    register(byTaskId, item?.taskId, item?.taskName || item?.bradialContactName)
+    register(byPhone, normalizeLeadPhone(item?.phone), item?.taskName || item?.bradialContactName)
+    register(byConversationId, item?.bradialConversationId, item?.taskName || item?.bradialContactName)
+    register(byContactId, item?.bradialContactId, item?.bradialContactName || item?.taskName)
+  }
+
+  return {
+    byTaskId,
+    byPhone,
+    byConversationId,
+    byContactId,
+  }
+}
+
+function resolveActivityName(entry, lookup = null) {
+  const directName =
+    entry?.contactName ||
+    entry?.taskName ||
+    entry?.result?.bradialContactName ||
+    entry?.result?.payload?.name ||
+    entry?.meta?.contactName ||
+    entry?.meta?.taskName ||
+    null
+
+  if (directName) return directName
+  if (!lookup) return null
+
+  const taskId = entry?.taskId || entry?.result?.taskId || entry?.meta?.taskId || null
+  const phone = entry?.phone || entry?.result?.phone || entry?.meta?.phone || null
+  const conversationId =
+    entry?.conversationId || entry?.result?.conversationSync?.conversationId || entry?.meta?.conversationId || null
+  const contactId =
+    entry?.chatContactId ||
+    entry?.result?.conversationSync?.chatContactId ||
+    entry?.result?.bradialContactId ||
+    entry?.meta?.chatContactId ||
+    entry?.meta?.bradialContactId ||
+    null
+
+  return (
+    lookup.byTaskId.get(String(taskId || '').trim()) ||
+    lookup.byConversationId.get(String(conversationId || '').trim()) ||
+    lookup.byContactId.get(String(contactId || '').trim()) ||
+    lookup.byPhone.get(String(normalizeLeadPhone(phone) || '').trim()) ||
+    null
+  )
+}
+
+function describeSyncSkipReason(entry) {
+  const reason = String(entry?.result?.reason || entry?.reason || '').trim()
+
+  switch (reason) {
+    case 'suppressed_clickup_duplicate':
+      return `duplicata no ClickUp; o sistema usa a task principal ${entry?.result?.canonicalTaskId || 'nao identificada'}.`
+    case 'conversation_required_for_stage_label':
+      return 'contato encontrado, mas a conversa ainda nao existe para receber a etiqueta.'
+    case 'contact_labels_synced_without_conversation':
+      return 'contato encontrado sem conversa; o sistema aguardou a conversa para etiquetar corretamente.'
+    case 'missing_phone':
+      return 'task sem telefone valido para vinculo.'
+    case 'ambiguous_clickup_phone':
+      return 'telefone encontrado em mais de uma task ativa do ClickUp.'
+    case 'ambiguous_bradial_phone':
+      return 'telefone encontrado em mais de um contato no Bradial.'
+    case 'task_not_in_scope':
+      return 'task fora do escopo monitorado.'
+    case 'terminal_status':
+      return 'task em status terminal sem destino valido no Bradial.'
+    case 'conversation_not_found':
+      return 'a conversa ainda nao foi encontrada no Bradial.'
+    default:
+      return reason || 'sem motivo informado.'
+  }
+}
+
+function buildActivityStats(syncAudit = []) {
+  const attempts = (Array.isArray(syncAudit) ? syncAudit : []).filter((entry) =>
+    ['sync_succeeded', 'sync_skipped', 'sync_failed', 'sync_failed_retrying'].includes(entry?.type),
+  )
+  const succeeded = attempts.filter((entry) => entry.type === 'sync_succeeded').length
+  const failed = attempts.filter((entry) => entry.type === 'sync_failed').length
+  const retrying = attempts.filter((entry) => entry.type === 'sync_failed_retrying').length
+  const skipped = attempts.filter((entry) => entry.type === 'sync_skipped').length
+  const duplicateSkips = attempts.filter(
+    (entry) => String(entry?.result?.reason || '') === 'suppressed_clickup_duplicate',
+  ).length
+  const actionableSkips = Math.max(0, skipped - duplicateSkips)
+  const usefulBase = succeeded + failed + retrying + actionableSkips
+
+  return {
+    attempts: attempts.length,
+    succeeded,
+    failed,
+    retrying,
+    skipped,
+    duplicateSkips,
+    actionableSkips,
+    successRate: usefulBase > 0 ? Math.round((succeeded / usefulBase) * 100) : null,
+  }
+}
+
+function describeSyncSuccess(entry, subject) {
+  const stageLabel = entry?.result?.stageLabel || null
+  const priority = entry?.result?.metadataSync?.priority || null
+  const conversationLabelOperation = entry?.result?.conversationSync?.conversationLabelOperation || null
+  const metadataOperation = entry?.result?.metadataSync?.operation || null
+  const assignmentOperation = entry?.result?.metadataSync?.assignmentOperation || null
+  const fragments = []
+
+  if (stageLabel && conversationLabelOperation === 'update') {
+    fragments.push(`recebeu a etiqueta ${stageLabel} na conversa`)
+  } else if (stageLabel && conversationLabelOperation === 'noop') {
+    fragments.push(`permaneceu com a etiqueta ${stageLabel} na conversa`)
+  }
+
+  if (metadataOperation === 'update' && priority) {
+    fragments.push(`ficou com prioridade ${priority}`)
+  }
+
+  if (assignmentOperation === 'update') {
+    fragments.push('foi atribuida ao agente correspondente')
+  } else if (assignmentOperation === 'clear') {
+    fragments.push('foi desatribuida no Bradial')
+  } else if (assignmentOperation === 'unmatched') {
+    fragments.push('nao encontrou agente correspondente para o responsavel do ClickUp')
+  }
+
+  if (entry?.result?.conversationSync?.reason === 'conversation_required_for_stage_label') {
+    fragments.push('segue sem etiqueta porque ainda nao existe conversa vinculada')
+  }
+
+  if (!fragments.length) {
+    return `${subject} foi verificada e ja estava sincronizada.`
+  }
+
+  return `${subject} ${fragments.join(', ')}.`
+}
+
+function describeAuditSource(entry) {
+  if (String(entry?.source || '').includes('bradial')) return 'Bradial -> ClickUp'
+  return 'ClickUp -> Bradial'
+}
+
+function describeLogSource(entry) {
+  const title = String(entry?.title || '')
+  const message = String(entry?.message || '')
+  const merged = `${title} ${message}`
+
+  if (/Bradial -> ClickUp/i.test(merged)) return 'Bradial -> ClickUp'
+  if (/ClickUp -> Bradial/i.test(merged)) return 'ClickUp -> Bradial'
+  if (/Webhook ClickUp/i.test(merged)) return 'ClickUp webhook'
+  if (/Webhook Bradial/i.test(merged)) return 'Bradial webhook'
+  return 'backend'
+}
+
+function summarizeAuditEntry(entry, lookup = null) {
+  const taskId = entry?.taskId || entry?.result?.taskId || null
+  const conversationId = entry?.conversationId || entry?.result?.conversationSync?.conversationId || null
+  const phone = entry?.phone || entry?.result?.phone || null
+  const contactName = resolveActivityName(entry, lookup)
+  const subject = contactName || `Task ${taskId || 'n/a'}`
+
+  if (entry?.type === 'sync_enqueued') {
+    return {
+      title: 'Sync enfileirado',
+      message: `${subject} entrou na fila por ${entry.trigger || 'evento'}.`,
+      reference: taskId || phone || null,
+    }
+  }
+
+  if (entry?.type === 'sync_started') {
+    return {
+      title: 'Sync iniciado',
+      message: `Processando ${subject} via ${entry.trigger || 'evento'}.`,
+      reference: taskId || phone || null,
+    }
+  }
+
+  if (entry?.type === 'sync_succeeded') {
+    return {
+      title: 'Sync concluido',
+      message: describeSyncSuccess(entry, subject),
+      reference: conversationId || taskId || phone || null,
+    }
+  }
+
+  if (entry?.type === 'sync_skipped') {
+    return {
+      title: 'Sync ignorado',
+      message: `${subject} foi ignorada: ${describeSyncSkipReason(entry)}`,
+      reference: taskId || phone || null,
+    }
+  }
+
+  if (entry?.type === 'sync_failed' || entry?.type === 'sync_failed_retrying') {
+    return {
+      title: entry.type === 'sync_failed_retrying' ? 'Sync falhou e vai tentar de novo' : 'Sync falhou',
+      message: `${subject} falhou: ${entry?.error || 'erro nao informado'}.`,
+      reference: taskId || phone || null,
+    }
+  }
+
+  if (entry?.type === 'sync_bradial_to_clickup') {
+    return {
+      title: 'Status Bradial -> ClickUp',
+      message: `${subject} foi movida para ${entry?.targetStatus || 'status indefinido'} a partir da tag ${entry?.targetLabel || 'n/a'} no Bradial.`,
+      reference: taskId || conversationId || null,
+    }
+  }
+
+  if (entry?.type === 'sync_bradial_priority_to_clickup') {
+    return {
+      title: 'Prioridade Bradial -> ClickUp',
+      message: `${subject} recebeu prioridade ${entry?.targetPriority || 'nenhuma'} a partir do Bradial.`,
+      reference: taskId || conversationId || null,
+    }
+  }
+
+  if (entry?.type === 'sync_bradial_to_clickup_failed' || entry?.type === 'sync_bradial_priority_to_clickup_failed') {
+    return {
+      title: 'Sync Bradial -> ClickUp falhou',
+      message: entry?.error || 'erro nao informado',
+      reference: conversationId || taskId || null,
+    }
+  }
+
+  return {
+    title: entry?.type || 'Evento de sync',
+    message: entry?.error || entry?.result?.reason || entry?.trigger || 'evento registrado na auditoria',
+    reference: taskId || conversationId || phone || null,
+  }
+}
+
+function buildActivityItems(logs = [], syncAudit = [], leads = [], pendingContacts = []) {
+  const lookup = buildActivityLookup(leads, pendingContacts)
+
+  const logItems = (Array.isArray(logs) ? logs : []).map((entry) => ({
+    id: `log:${entry.id}`,
+    sourceKind: 'log',
+    sourceLabel: describeLogSource(entry),
+    level: entry.level || 'info',
+    title: entry.title || 'Log operacional',
+    message: entry.message || '',
+    contactName: resolveActivityName(entry, lookup),
+    reference:
+      entry?.meta?.taskId ||
+      entry?.meta?.conversationId ||
+      entry?.meta?.phone ||
+      entry?.leadId ||
+      null,
+    createdAt: entry.createdAt || new Date().toISOString(),
+  }))
+
+  const auditItems = (Array.isArray(syncAudit) ? syncAudit : []).map((entry) => {
+    const summary = summarizeAuditEntry(entry, lookup)
+    return {
+      id: `audit:${entry.id}`,
+      sourceKind: 'audit',
+      sourceLabel: describeAuditSource(entry),
+      level: entry.level || 'info',
+      title: summary.title,
+      message: summary.message,
+      contactName: resolveActivityName(entry, lookup),
+      reference: summary.reference,
+      createdAt: entry.createdAt || new Date().toISOString(),
+    }
+  })
+
+  return [...auditItems, ...logItems].sort(
+    (left, right) => toEventTimestamp(right.createdAt) - toEventTimestamp(left.createdAt),
+  )
 }
 
 function normalizeLeadPhone(value) {
@@ -247,11 +596,13 @@ function App() {
     bootInLiveMode ? [] : initialExceptions,
   )
   const [logs, setLogs] = usePersistentState('logs', bootInLiveMode ? [] : initialLogs)
+  const [syncAudit, setSyncAudit] = usePersistentState('syncAudit', [])
   const [selectedLeadId, setSelectedLeadId] = usePersistentState(
     'selectedLeadId',
     bootInLiveMode ? null : initialLeads[0]?.id ?? null,
   )
   const [leadSearch, setLeadSearch] = useState('')
+  const [activityFilter, setActivityFilter] = usePersistentState('activityFilter', 'all')
   const [connectionState, setConnectionState] = useState('idle')
   const [syncingTaskId, setSyncingTaskId] = useState(null)
   const [creatingWebhookUrl, setCreatingWebhookUrl] = useState(false)
@@ -268,6 +619,17 @@ function App() {
   const healthyLeads = unifiedLeads.filter((lead) => lead.health === 'healthy').length
   const warningLeads = unifiedLeads.filter((lead) => lead.health === 'warning').length
   const actionablePendingContacts = pendingContacts.filter((item) => item.syncAllowed).length
+  const activityStats = buildActivityStats(syncAudit)
+  const activityItems = buildActivityItems(logs, syncAudit, unifiedLeads, pendingContacts)
+  const filteredActivityItems = activityItems.filter((item) => {
+    if (activityFilter === 'alerts') {
+      return ['warning', 'error', 'risk'].includes(item.level)
+    }
+    if (activityFilter === 'sync') {
+      return item.sourceKind === 'audit'
+    }
+    return true
+  })
 
   const filteredLeads = unifiedLeads.filter((lead) => {
     const search = deferredLeadSearch.trim().toLowerCase()
@@ -306,6 +668,7 @@ function App() {
 
     setLeads([])
     setPendingContacts([])
+    setSyncAudit([])
     setSelectedLeadId(null)
     setLiveSessionHydrated(true)
   }, [
@@ -313,6 +676,7 @@ function App() {
     liveSessionHydrated,
     setLeads,
     setPendingContacts,
+    setSyncAudit,
     setSelectedLeadId,
   ])
 
@@ -330,8 +694,9 @@ function App() {
     })
     setExceptions(initialExceptions)
     setLogs(initialLogs)
+    setSyncAudit([])
     setSelectedLeadId(dedupeLeads(initialLeads)[0]?.id ?? null)
-  }, [config.mode, setExceptions, setHealth, setLeads, setLogs, setPendingContacts, setSelectedLeadId, setWebhookRegistry])
+  }, [config.mode, setExceptions, setHealth, setLeads, setLogs, setPendingContacts, setSelectedLeadId, setSyncAudit, setWebhookRegistry])
 
   const pushLog = useEffectEvent((entry) => {
     setLogs((current) => [entry, ...current].slice(0, 120))
@@ -429,7 +794,7 @@ function App() {
   useEffect(() => {
     if (config.mode !== 'live' || !config.backendUrl.trim()) return undefined
 
-    const eventSource = new EventSource(`${config.backendUrl.replace(/\/$/, '')}/events`)
+    const eventSource = new EventSource(buildEventStreamUrl(config))
 
     const handleSnapshot = () => {
       scheduleLivePull('snapshot')
@@ -438,6 +803,7 @@ function App() {
     const handleSyncAudit = (event) => {
       try {
         const payload = JSON.parse(event.data || '{}')
+        setSyncAudit((current) => mergeRecentEntries(current, [payload]))
         if (
           [
             'sync_enqueued',
@@ -465,7 +831,7 @@ function App() {
         livePullTimeoutRef.current = null
       }
     }
-  }, [config.backendUrl, config.mode, scheduleLivePull])
+  }, [config.adminApiToken, config.backendUrl, config.mode, scheduleLivePull, setSyncAudit])
 
   const saveConfig = () => {
     pushLog(
@@ -492,8 +858,7 @@ function App() {
     setConnectionState('loading')
 
     try {
-      const baseUrl = config.backendUrl.replace(/\/$/, '')
-      const response = await fetch(`${baseUrl}/refresh`, { method: 'POST' })
+      const response = await fetchBackend(config, '/refresh', { method: 'POST' })
 
       if (!response.ok) {
         throw new Error(`HTTP ${response.status} no endpoint /refresh`)
@@ -520,19 +885,20 @@ function App() {
     if (config.mode !== 'live' || !config.backendUrl.trim()) return
 
     try {
-      const baseUrl = config.backendUrl.replace(/\/$/, '')
       const [
         leadsResponse,
         exceptionsResponse,
         logsResponse,
         pendingContactsResponse,
         webhookIntegrationsResponse,
+        syncAuditResponse,
       ] = await Promise.all([
-        fetch(`${baseUrl}/leads`),
-        fetch(`${baseUrl}/exceptions`),
-        fetch(`${baseUrl}/logs`),
-        fetch(`${baseUrl}/clickup/pending-contacts`),
-        fetch(`${baseUrl}/clickup/webhook-integrations`),
+        fetchBackend(config, '/leads'),
+        fetchBackend(config, '/exceptions'),
+        fetchBackend(config, '/logs'),
+        fetchBackend(config, '/clickup/pending-contacts'),
+        fetchBackend(config, '/clickup/webhook-integrations'),
+        fetchBackend(config, '/sync/audit?limit=120'),
       ])
 
       if (
@@ -540,7 +906,8 @@ function App() {
         !exceptionsResponse.ok ||
         !logsResponse.ok ||
         !pendingContactsResponse.ok ||
-        !webhookIntegrationsResponse.ok
+        !webhookIntegrationsResponse.ok ||
+        !syncAuditResponse.ok
       ) {
         throw new Error('Um dos endpoints respondeu com erro')
       }
@@ -551,18 +918,21 @@ function App() {
         nextLogs,
         nextPendingContacts,
         nextWebhookRegistry,
+        nextSyncAudit,
       ] = await Promise.all([
         leadsResponse.json(),
         exceptionsResponse.json(),
         logsResponse.json(),
         pendingContactsResponse.json(),
         webhookIntegrationsResponse.json(),
+        syncAuditResponse.json(),
       ])
 
       setLeads(dedupeLeads(Array.isArray(nextLeads) ? nextLeads : []))
       setExceptions(Array.isArray(nextExceptions) ? nextExceptions : [])
       setLogs(Array.isArray(nextLogs) ? nextLogs : [])
       setPendingContacts(Array.isArray(nextPendingContacts) ? nextPendingContacts : [])
+      setSyncAudit(Array.isArray(nextSyncAudit) ? nextSyncAudit : [])
       setWebhookRegistry(
         nextWebhookRegistry && typeof nextWebhookRegistry === 'object'
           ? nextWebhookRegistry
@@ -579,9 +949,9 @@ function App() {
           createLog(
             'success',
             'Dados reais carregados',
-            `${Array.isArray(nextLeads) ? nextLeads.length : 0} leads e ${
+            `${Array.isArray(nextLeads) ? nextLeads.length : 0} leads, ${
               Array.isArray(nextPendingContacts) ? nextPendingContacts.length : 0
-            } pendencias importados do backend`,
+            } pendencias e ${Array.isArray(nextSyncAudit) ? nextSyncAudit.length : 0} eventos importados do backend`,
           ),
         )
       }
@@ -620,7 +990,7 @@ function App() {
     const timeoutId = window.setTimeout(() => controller.abort(), 15000)
 
     try {
-      const response = await fetch(`${config.backendUrl.replace(/\/$/, '')}/health`, {
+      const response = await fetchBackend(config, '/health', {
         signal: controller.signal,
       })
       const payload = await response.json().catch(() => ({}))
@@ -628,7 +998,7 @@ function App() {
 
       setHealth({
         status: response.ok ? 'online' : 'degraded',
-        detail: payload.status || `HTTP ${response.status}`,
+        detail: payload.error || payload.status || `HTTP ${response.status}`,
         lastCheckedAt: new Date().toISOString(),
         latencyMs,
       })
@@ -682,12 +1052,12 @@ function App() {
     }, 10000)
 
     return () => window.clearInterval(intervalId)
-  }, [config.autoPoll, config.backendUrl, config.mode])
+  }, [config.adminApiToken, config.autoPoll, config.backendUrl, config.mode])
 
   useEffect(() => {
     if (config.mode !== 'live') return
     void pingBackend(true)
-  }, [config.mode, config.backendUrl])
+  }, [config.adminApiToken, config.mode, config.backendUrl])
 
   const handleResolveException = (exceptionId) => {
     const target = exceptions.find((item) => item.id === exceptionId)
@@ -837,8 +1207,7 @@ function App() {
     setSyncingTaskId(pendingTask.taskId)
 
     try {
-      const baseUrl = config.backendUrl.replace(/\/$/, '')
-      const response = await fetch(`${baseUrl}/clickup/tasks/${pendingTask.taskId}/sync-to-bradial`, {
+      const response = await fetchBackend(config, `/clickup/tasks/${pendingTask.taskId}/sync-to-bradial`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -889,8 +1258,7 @@ function App() {
     setCreatingWebhookUrl(true)
 
     try {
-      const baseUrl = config.backendUrl.replace(/\/$/, '')
-      const response = await fetch(`${baseUrl}/clickup/webhook-integrations`, {
+      const response = await fetchBackend(config, '/clickup/webhook-integrations', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -927,6 +1295,7 @@ function App() {
 
   const clearLogs = () => {
     setLogs([])
+    setSyncAudit([])
   }
 
   const selectedLeadLogs = logs.filter((entry) => entry.leadId === selectedLead?.id).slice(0, 6)
@@ -962,6 +1331,97 @@ function App() {
           ) : null}
         </div>
       </header>
+
+      <section className="panel section-card">
+        <div className="section-heading">
+          <div>
+            <p className="eyebrow">Movimentacoes</p>
+            <h2>Tela em tempo real</h2>
+          </div>
+          <div className="detail-actions">
+            <button
+              className={activityFilter === 'all' ? '' : 'ghost-button'}
+              type="button"
+              onClick={() => setActivityFilter('all')}
+            >
+              Tudo
+            </button>
+            <button
+              className={activityFilter === 'sync' ? '' : 'ghost-button'}
+              type="button"
+              onClick={() => setActivityFilter('sync')}
+            >
+              Sync
+            </button>
+            <button
+              className={activityFilter === 'alerts' ? '' : 'ghost-button'}
+              type="button"
+              onClick={() => setActivityFilter('alerts')}
+            >
+              Alertas
+            </button>
+            {config.mode === 'mock' ? (
+              <button type="button" onClick={runMockTick}>
+                Gerar evento
+              </button>
+            ) : (
+              <button type="button" onClick={() => void refreshBackendSnapshot()}>
+                Atualizar snapshot
+              </button>
+            )}
+            <button className="ghost-button" type="button" onClick={clearLogs}>
+              Limpar logs
+            </button>
+          </div>
+        </div>
+
+        <div className="activity-summary-row">
+          <span className="pill pill-info">{activityItems.length} eventos</span>
+          <span className="pill pill-success">{activityStats.succeeded} sucessos</span>
+          <span className="pill pill-warning">{activityStats.duplicateSkips} duplicatas suprimidas</span>
+          <span className={`pill ${activityStats.failed || activityStats.retrying ? 'pill-risk' : 'pill-info'}`}>
+            {activityStats.failed + activityStats.retrying} falhas
+          </span>
+          {activityStats.successRate !== null ? (
+            <span className="pill pill-info">taxa util {activityStats.successRate}%</span>
+          ) : null}
+          <span className="activity-summary-copy">
+            stream unificado de auditoria de sync e logs operacionais, com duplicatas separadas da taxa util
+          </span>
+        </div>
+
+        <div className="activity-panel">
+          {filteredActivityItems.length === 0 ? (
+            <div className="empty-state">
+              <strong>Nenhuma movimentacao visivel</strong>
+              <p>Gere um evento mock ou conecte um backend real para popular a timeline.</p>
+            </div>
+          ) : (
+            filteredActivityItems.map((entry) => (
+              <article key={entry.id} className="activity-row">
+                <div className="activity-rail">
+                  <span className={`log-dot tone-${entry.level}`} />
+                </div>
+                <div className="activity-content">
+                  <div className="activity-header">
+                    <strong>{entry.title}</strong>
+                    <div className="activity-badges">
+                      <span className={`pill pill-${entry.level}`}>{entry.level}</span>
+                      <span className="pill pill-info">{entry.sourceLabel}</span>
+                    </div>
+                  </div>
+                  <p>{entry.message}</p>
+                  <div className="activity-meta">
+                    <span>{entry.contactName || 'contato nao identificado'}</span>
+                    <span>{entry.reference || 'global'}</span>
+                    <small>{formatDate(entry.createdAt)}</small>
+                  </div>
+                </div>
+              </article>
+            ))
+          )}
+        </div>
+      </section>
 
       <section className="summary-grid">
         <article className="stat-card panel">
@@ -1026,6 +1486,19 @@ function App() {
                     setConfig((current) => ({ ...current, backendUrl: event.target.value }))
                   }
                   placeholder="http://localhost:3015"
+                />
+              </label>
+
+              <label>
+                <span>Token admin</span>
+                <input
+                  type="password"
+                  value={config.adminApiToken || ''}
+                  onChange={(event) =>
+                    setConfig((current) => ({ ...current, adminApiToken: event.target.value }))
+                  }
+                  placeholder="Bearer token do backend"
+                  autoComplete="new-password"
                 />
               </label>
 
@@ -1157,6 +1630,7 @@ function App() {
               <code>GET /clickup/health</code>
               <code>GET /clickup/tasks</code>
               <code>GET /clickup/pending-contacts</code>
+              <code>GET /sync/audit</code>
               <code>POST /clickup/tasks/:taskId/sync-to-bradial</code>
               <code>POST /webhooks/bradial/chatwoot</code>
               <code>POST /refresh</code>
@@ -1416,51 +1890,6 @@ function App() {
             </div>
           </section>
 
-          <section className="panel section-card">
-            <div className="section-heading">
-              <div>
-                <p className="eyebrow">Telemetria</p>
-                <h2>Stream de logs</h2>
-              </div>
-              <div className="detail-actions">
-                {config.mode === 'mock' ? (
-                  <button type="button" onClick={runMockTick}>
-                    Gerar evento
-                  </button>
-                ) : (
-                  <button type="button" onClick={() => void refreshBackendSnapshot()}>
-                    Atualizar snapshot
-                  </button>
-                )}
-                <button className="ghost-button" type="button" onClick={clearLogs}>
-                  Limpar logs
-                </button>
-              </div>
-            </div>
-
-            <div className="logs-panel">
-              {logs.length === 0 ? (
-                <div className="empty-state">
-                  <strong>Nenhum log carregado</strong>
-                  <p>Gere um evento mock ou conecte um backend real para popular a lista.</p>
-                </div>
-              ) : (
-                logs.map((entry) => (
-                  <article key={entry.id} className="log-row">
-                    <div className={`log-level tone-${entry.level}`}>{entry.level}</div>
-                    <div className="log-content">
-                      <strong>{entry.title}</strong>
-                      <p>{entry.message}</p>
-                    </div>
-                    <div className="log-meta">
-                      <span>{entry.leadId || 'global'}</span>
-                      <small>{formatDate(entry.createdAt)}</small>
-                    </div>
-                  </article>
-                ))
-              )}
-            </div>
-          </section>
         </main>
       </section>
     </div>

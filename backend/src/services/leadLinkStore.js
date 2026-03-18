@@ -1,35 +1,14 @@
-import fs from 'node:fs'
-import path from 'node:path'
+import { readJsonStoreSync, writeJsonStoreAtomicSync } from '../utils/jsonStore.js'
 
-function ensureStoreFile(storePath) {
-  const directory = path.dirname(storePath)
-  if (!fs.existsSync(directory)) {
-    fs.mkdirSync(directory, { recursive: true })
-  }
-
-  if (!fs.existsSync(storePath)) {
-    fs.writeFileSync(
-      storePath,
-      JSON.stringify({ version: 1, items: [] }, null, 2),
-      'utf8',
-    )
-  }
+function createEmptyStore() {
+  return { version: 1, items: [] }
 }
 
-function readStore(storePath) {
-  ensureStoreFile(storePath)
-  const raw = fs.readFileSync(storePath, 'utf8').replace(/^\uFEFF/, '')
-  const parsed = JSON.parse(raw)
-
+function normalizeStore(parsed) {
   return {
     version: 1,
     items: Array.isArray(parsed?.items) ? parsed.items : [],
   }
-}
-
-function writeStore(storePath, payload) {
-  ensureStoreFile(storePath)
-  fs.writeFileSync(storePath, JSON.stringify(payload, null, 2), 'utf8')
 }
 
 export function createLeadLinkStore(config, pushLog = () => {}) {
@@ -39,8 +18,29 @@ export function createLeadLinkStore(config, pushLog = () => {}) {
     throw new Error('Defina um caminho para armazenar os vinculos de lead.')
   }
 
+  function readStore() {
+    return normalizeStore(
+      readJsonStoreSync(storePath, createEmptyStore, {
+        onCorrupt(error, corruptPath) {
+          pushLog(
+            'warning',
+            'Store de vinculos de lead restaurada',
+            corruptPath
+              ? `Arquivo corrompido arquivado em ${corruptPath}.`
+              : `Falha ao ler ${storePath}; store recriada.`,
+            { storePath, corruptPath, error: error.message },
+          )
+        },
+      }),
+    )
+  }
+
+  function writeStore(payload) {
+    writeJsonStoreAtomicSync(storePath, normalizeStore(payload))
+  }
+
   function listLinks() {
-    return readStore(storePath).items
+    return readStore().items
   }
 
   function findLink({ taskId = null, phone = null } = {}) {
@@ -96,7 +96,7 @@ export function createLeadLinkStore(config, pushLog = () => {}) {
       return null
     }
 
-    const store = readStore(storePath)
+    const store = readStore()
     const index = store.items.findIndex(
       (item) =>
         (normalizedTaskId && String(item.taskId || '').trim() === normalizedTaskId) ||
@@ -123,7 +123,7 @@ export function createLeadLinkStore(config, pushLog = () => {}) {
       store.items.unshift(record)
     }
 
-    writeStore(storePath, store)
+    writeStore(store)
 
     pushLog(
       'info',
@@ -149,7 +149,7 @@ export function createLeadLinkStore(config, pushLog = () => {}) {
       return 0
     }
 
-    const store = readStore(storePath)
+    const store = readStore()
     let updatedCount = 0
 
     store.items = store.items.map((item) => {
@@ -172,7 +172,7 @@ export function createLeadLinkStore(config, pushLog = () => {}) {
     })
 
     if (updatedCount > 0) {
-      writeStore(storePath, store)
+      writeStore(store)
       pushLog(
         'info',
         'Vinculos de lead reamarrados',

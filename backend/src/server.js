@@ -14,17 +14,27 @@ import {
   listControlledStageLabels,
   normalizeLabelKey,
   pickControlledLabels,
+  resolveBradialStageLabel,
+  resolveBradialStageLabels,
   resolveClickupStatusFromLabel,
 } from './services/clickupStageLabels.js'
 import {
   resolveClickupPhoneConflict,
 } from './services/clickupTaskResolution.js'
 import { buildConsolidatedSnapshot } from './services/consolidation.js'
+import {
+  extractClickupWebhookContext,
+  isClosedOpportunityTask,
+  normalizeChatPriority,
+} from './services/clickupLeadContext.js'
 import { normalizePhone, phonesMatchLoose } from './utils/normalizers.js'
 
 dotenv.config()
 
 const PORT = Number(process.env.PORT || 3015)
+const ADMIN_API_TOKEN = String(
+  process.env.ADMIN_API_TOKEN || process.env.BACKEND_ADMIN_TOKEN || '',
+).trim()
 
 // CORS_ORIGINS aceita lista separada por vírgula. Use '*' para liberar tudo (dev only).
 // Fallback: FRONTEND_ORIGIN (compatibilidade retroativa) ou localhost:4180
@@ -39,19 +49,28 @@ const CORS_ORIGINS = (() => {
     ),
   ]
 })()
-const BRADIAL_REFRESH_MS = Math.max(15_000, Number(process.env.BRADIAL_REFRESH_MS || 60_000))
+const BRADIAL_REFRESH_MS = Math.max(5_000, Number(process.env.BRADIAL_REFRESH_MS || 60_000))
 const BRADIAL_OPPORTUNITY_LABEL =
   String(process.env.BRADIAL_OPPORTUNITY_LABEL || 'OPORTUNIDADE').trim() || 'OPORTUNIDADE'
 const BRADIAL_SYNC_CONVERSATION_LABELS = !['0', 'false', 'no', 'off'].includes(
   String(process.env.BRADIAL_SYNC_CONVERSATION_LABELS || 'true').trim().toLowerCase(),
 )
-const BRADIAL_SYNC_CONTACT_LABELS = !['0', 'false', 'no', 'off'].includes(
+const BRADIAL_SYNC_CONTACT_LABELS_RAW = !['0', 'false', 'no', 'off'].includes(
   String(process.env.BRADIAL_SYNC_CONTACT_LABELS || 'false').trim().toLowerCase(),
+)
+const BRADIAL_STAGE_LABEL_SCOPE =
+  String(process.env.BRADIAL_STAGE_LABEL_SCOPE || 'conversation').trim().toLowerCase() === 'contact'
+    ? 'contact'
+    : 'conversation'
+const BRADIAL_SYNC_CONTACT_LABELS =
+  BRADIAL_STAGE_LABEL_SCOPE === 'contact' && BRADIAL_SYNC_CONTACT_LABELS_RAW
+const BRADIAL_CHAT_AUTO_CREATE_CONVERSATIONS = !['0', 'false', 'no', 'off'].includes(
+  String(process.env.BRADIAL_CHAT_AUTO_CREATE_CONVERSATIONS || 'false').trim().toLowerCase(),
 )
 const SYNC_MAX_ATTEMPTS = Math.max(1, Number(process.env.SYNC_MAX_ATTEMPTS || 4))
 const SYNC_RETRY_BASE_MS = Math.max(500, Number(process.env.SYNC_RETRY_BASE_MS || 1_500))
 const SYNC_CONCURRENCY = Math.max(1, Number(process.env.SYNC_CONCURRENCY || 6))
-const SYNC_RECONCILE_MS = Math.max(30_000, Number(process.env.SYNC_RECONCILE_MS || 90_000))
+const SYNC_RECONCILE_MS = Math.max(10_000, Number(process.env.SYNC_RECONCILE_MS || 90_000))
 const SYNC_RECONCILE_BATCH_SIZE = Math.max(1, Number(process.env.SYNC_RECONCILE_BATCH_SIZE || 5))
 const SYNC_RECONCILE_LOOKBACK_MS = Math.max(
   60_000,
@@ -60,6 +79,9 @@ const SYNC_RECONCILE_LOOKBACK_MS = Math.max(
 const DEFERRED_REFRESH_MS = Math.max(100, Number(process.env.DEFERRED_REFRESH_MS || 150))
 const CLICKUP_STAGE_LABEL_MAP = buildStageLabelMap(process.env.CLICKUP_STAGE_LABEL_MAP)
 const CLICKUP_WEBHOOK_SECRET = String(process.env.CLICKUP_WEBHOOK_SECRET || '').trim()
+const CLICKUP_URGENCY_FIELD_NAMES = String(process.env.CLICKUP_URGENCY_FIELD_NAMES || '').trim()
+const CLICKUP_CLOSED_STAGE_LABELS =
+  String(process.env.CLICKUP_CLOSED_STAGE_LABELS || 'negocio-fechado').trim() || 'negocio-fechado'
 const BRADIAL_CHAT_WEBHOOK_SECRET = String(process.env.BRADIAL_CHAT_WEBHOOK_SECRET || '').trim()
 const BRADIAL_CHAT_WEBHOOK_MAX_AGE_SEC = Math.max(
   0,
@@ -69,7 +91,24 @@ const BRADIAL_STAGE_SUPPRESSION_WINDOW_MS = Math.max(
   30_000,
   Number(process.env.BRADIAL_STAGE_SUPPRESSION_WINDOW_MS || 120_000),
 )
+const CLICKUP_RECONCILE_SUPPRESSION_WINDOW_MS = Math.max(
+  30_000,
+  Number(process.env.CLICKUP_RECONCILE_SUPPRESSION_WINDOW_MS || 120_000),
+)
 const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || '').trim()
+const BRADIAL_AGENT_ALIAS_MAP = String(process.env.BRADIAL_AGENT_ALIAS_MAP || '').trim()
+const BRADIAL_SYNC_CONVERSATION_PRIORITY = !['0', 'false', 'no', 'off'].includes(
+  String(process.env.BRADIAL_SYNC_CONVERSATION_PRIORITY || 'true').trim().toLowerCase(),
+)
+const BRADIAL_SYNC_CONVERSATION_ASSIGNMENT = !['0', 'false', 'no', 'off'].includes(
+  String(process.env.BRADIAL_SYNC_CONVERSATION_ASSIGNMENT || 'true').trim().toLowerCase(),
+)
+const BRADIAL_SYNC_CLOSED_BY_ASSIGNMENT = !['0', 'false', 'no', 'off'].includes(
+  String(process.env.BRADIAL_SYNC_CLOSED_BY_ASSIGNMENT || 'true').trim().toLowerCase(),
+)
+const BRADIAL_SYNC_CLOSED_BY_ATTRIBUTES = !['0', 'false', 'no', 'off'].includes(
+  String(process.env.BRADIAL_SYNC_CLOSED_BY_ATTRIBUTES || 'true').trim().toLowerCase(),
+)
 const CLICKUP_INTEGRATIONS_PATH =
   String(process.env.CLICKUP_INTEGRATIONS_PATH || '').trim() ||
   path.resolve(process.cwd(), 'runtime-data', 'clickup-integrations.json')
@@ -103,6 +142,16 @@ app.addContentTypeParser('application/json', { parseAs: 'string' }, (request, bo
 
 await app.register(cors, {
   origin: CORS_ORIGINS,
+  allowedHeaders: [
+    'Authorization',
+    'Content-Type',
+    'X-Admin-Token',
+    'X-Signature',
+    'X-Chatwoot-Signature',
+    'X-Chatwoot-Timestamp',
+    'X-Hub-Signature-256',
+    'X-Request-Timestamp',
+  ],
 })
 
 const runtime = {
@@ -116,6 +165,7 @@ const runtime = {
     leads: [],
     exceptions: [],
     agents: [],
+    chatAgents: [],
     inboxes: [],
     clickup: {
       health: null,
@@ -129,6 +179,7 @@ const runtime = {
   processedWebhookKeys: [],
   clickupTaskStateIndex: new Map(),
   queuedStageReconcileTaskIds: new Set(),
+  queuedStageReconcileContextByTaskId: new Map(),
   sync: {
     queue: [],
     queuedByTaskId: new Map(),
@@ -148,12 +199,71 @@ const runtime = {
     },
   },
 }
+
+function extractBearerToken(headerValue) {
+  const match = String(headerValue || '').trim().match(/^Bearer\s+(.+)$/i)
+  return match?.[1]?.trim() || null
+}
+
+function extractAdminToken(request) {
+  const headerToken =
+    extractBearerToken(request.headers.authorization) ||
+    String(request.headers['x-admin-token'] || '').trim() ||
+    null
+
+  if (headerToken) return headerToken
+
+  const rawUrl = String(request.raw.url || request.url || '')
+  const queryString = rawUrl.includes('?') ? rawUrl.slice(rawUrl.indexOf('?') + 1) : ''
+  const queryToken = new URLSearchParams(queryString).get('adminToken')
+  return String(queryToken || '').trim() || null
+}
+
+function isValidAdminToken(candidate) {
+  if (!ADMIN_API_TOKEN) return true
+  if (!candidate || candidate.length !== ADMIN_API_TOKEN.length) return false
+
+  return crypto.timingSafeEqual(Buffer.from(candidate), Buffer.from(ADMIN_API_TOKEN))
+}
+
+function isPublicRequestPath(requestPath) {
+  return requestPath === '/healthz' || requestPath.startsWith('/webhooks/')
+}
+
+function resolveSseAllowedOrigin(request) {
+  const requestOrigin = String(request.headers.origin || '').trim()
+
+  if (CORS_ORIGINS === true) {
+    return requestOrigin || '*'
+  }
+
+  if (requestOrigin && CORS_ORIGINS.includes(requestOrigin)) {
+    return requestOrigin
+  }
+
+  return CORS_ORIGINS[0] || 'http://localhost:4180'
+}
+
+app.addHook('onRequest', async (request, reply) => {
+  if (!ADMIN_API_TOKEN || request.method === 'OPTIONS') return
+
+  const requestPath = String(request.raw.url || request.url || '').split('?')[0]
+  if (isPublicRequestPath(requestPath)) return
+
+  if (isValidAdminToken(extractAdminToken(request))) return
+
+  reply.code(401)
+  return reply.send({
+    error: 'Acesso administrativo nao autorizado.',
+  })
+})
 let inflightRefresh = null
 let inflightStageReconcile = null
 let deferredRefreshTimer = null
 let syncStatePersistTimer = null
 const sseClients = new Set()
 const recentStageSyncSuppressions = new Map()
+const recentClickupReconcileSuppressions = new Map()
 
 function broadcastSse(event, payload = {}) {
   const message = `event: ${event}\ndata: ${JSON.stringify({
@@ -230,6 +340,14 @@ const bradial = createBradialAdapter(
     stageLabelMap: CLICKUP_STAGE_LABEL_MAP,
     syncConversationLabels: BRADIAL_SYNC_CONVERSATION_LABELS,
     syncContactLabels: BRADIAL_SYNC_CONTACT_LABELS,
+    syncConversationPriority: BRADIAL_SYNC_CONVERSATION_PRIORITY,
+    syncConversationAssignment: BRADIAL_SYNC_CONVERSATION_ASSIGNMENT,
+    syncClosedByAssignment: BRADIAL_SYNC_CLOSED_BY_ASSIGNMENT,
+    syncClosedByAttributes: BRADIAL_SYNC_CLOSED_BY_ATTRIBUTES,
+    autoCreateConversations: BRADIAL_CHAT_AUTO_CREATE_CONVERSATIONS,
+    agentAliasMap: BRADIAL_AGENT_ALIAS_MAP,
+    urgencyFieldNames: CLICKUP_URGENCY_FIELD_NAMES,
+    closedStageLabels: CLICKUP_CLOSED_STAGE_LABELS,
     requestMaxAttempts: process.env.BRADIAL_REQUEST_MAX_ATTEMPTS,
     requestRetryBaseMs: process.env.BRADIAL_REQUEST_RETRY_BASE_MS,
     conversationSearchPages: process.env.BRADIAL_CONVERSATION_SEARCH_PAGES,
@@ -247,6 +365,7 @@ const clickup = createClickupAdapter(
     commercialSpaceName: process.env.CLICKUP_COMMERCIAL_SPACE_NAME,
     commercialFolderName: process.env.CLICKUP_COMMERCIAL_FOLDER_NAME,
     commercialListName: process.env.CLICKUP_COMMERCIAL_LIST_NAME,
+    urgencyFieldNames: CLICKUP_URGENCY_FIELD_NAMES,
     maxListPages: process.env.CLICKUP_MAX_LIST_PAGES,
     backupClientName: process.env.CLICKUP_BACKUP_CLIENT_NAME,
     clientsBackupPath: process.env.CLICKUP_CLIENTS_BACKUP_PATH,
@@ -279,43 +398,107 @@ function getControlledStageLabels(tasks = runtime.cache.clickup.tasks) {
   return listControlledStageLabels(tasks, CLICKUP_STAGE_LABEL_MAP)
 }
 
+function buildTrackedClickupTaskState(task = {}) {
+  const assigneesSignature = Array.isArray(task.assignees)
+    ? [...task.assignees].map((item) => String(item || '').trim()).filter(Boolean).sort().join('|')
+    : ''
+
+  return {
+    status: String(task.status || '').trim(),
+    statusType: String(task.statusType || '').trim(),
+    phone: normalizePhone(task.phone),
+    priority: String(task.priority || '').trim(),
+    urgency: String(task.urgency || '').trim(),
+    eventInviteConfirmed: task.eventInviteConfirmed === true ? 'true' : 'false',
+    owner: String(task.owner || '').trim(),
+    assigneesSignature,
+    dateClosed: String(task.dateClosed || '').trim(),
+  }
+}
+
 function buildClickupTaskStateIndex(tasks = []) {
   const index = new Map()
 
   for (const task of tasks || []) {
-    index.set(String(task.id), {
-      status: String(task.status || '').trim(),
-      phone: normalizePhone(task.phone),
-    })
+    index.set(String(task.id), buildTrackedClickupTaskState(task))
   }
 
   return index
 }
 
+function buildTrackedClickupTaskStateSignature(task = {}) {
+  const state = buildTrackedClickupTaskState(task)
+  return [
+    state.status,
+    state.statusType,
+    state.phone,
+    state.priority,
+    state.urgency,
+    state.eventInviteConfirmed,
+    state.owner,
+    state.assigneesSignature,
+    state.dateClosed,
+  ].join('|')
+}
+
 function collectChangedClickupTaskIds(tasks = [], previousIndex = new Map()) {
   if (!previousIndex.size) return []
 
-  const changedTaskIds = []
+  const changedTasks = []
 
   for (const task of tasks || []) {
     const currentTaskId = String(task.id)
     const previous = previousIndex.get(currentTaskId)
     if (!previous) continue
 
-    const currentStatus = String(task.status || '').trim()
-    const currentPhone = normalizePhone(task.phone)
+    const current = buildTrackedClickupTaskState(task)
+    const statusChanged = previous.status !== current.status || previous.statusType !== current.statusType
+    const phoneChanged = previous.phone !== current.phone
+    const priorityChanged = previous.priority !== current.priority || previous.urgency !== current.urgency
+    const eventInviteConfirmedChanged = previous.eventInviteConfirmed !== current.eventInviteConfirmed
+    const ownerChanged =
+      previous.owner !== current.owner ||
+      previous.assigneesSignature !== current.assigneesSignature ||
+      previous.dateClosed !== current.dateClosed
 
-    if (previous.status !== currentStatus || previous.phone !== currentPhone) {
-      changedTaskIds.push(currentTaskId)
+    if (statusChanged || phoneChanged || priorityChanged || eventInviteConfirmedChanged || ownerChanged) {
+      changedTasks.push({
+        taskId: currentTaskId,
+        clickupContext: {
+          event: 'snapshot_reconcile',
+          actor: null,
+          field:
+            priorityChanged && !statusChanged && !phoneChanged && !eventInviteConfirmedChanged && !ownerChanged
+              ? 'priority'
+              : eventInviteConfirmedChanged &&
+                  !statusChanged &&
+                  !phoneChanged &&
+                  !priorityChanged &&
+                  !ownerChanged
+                ? 'confirmou invite para o evento'
+                : null,
+          customFieldName: null,
+          isStatusEvent: statusChanged,
+          isPriorityEvent: priorityChanged,
+        },
+      })
     }
   }
 
-  return changedTaskIds
+  return changedTasks
 }
 
 function scheduleStageReconcile(taskIds = [], trigger = 'refresh') {
-  for (const taskId of taskIds) {
-    if (taskId) runtime.queuedStageReconcileTaskIds.add(String(taskId))
+  for (const item of taskIds) {
+    const taskId = typeof item === 'string' ? item : item?.taskId
+    if (!taskId) continue
+
+    const normalizedTaskId = String(taskId)
+    runtime.queuedStageReconcileTaskIds.add(normalizedTaskId)
+
+    if (item?.clickupContext && typeof item.clickupContext === 'object') {
+      runtime.queuedStageReconcileContextByTaskId.set(normalizedTaskId, item.clickupContext)
+    }
   }
 
   if (!runtime.queuedStageReconcileTaskIds.size || inflightStageReconcile) return
@@ -338,10 +521,49 @@ async function queueStageReconcile(trigger) {
   let enqueuedCount = 0
 
   for (const taskId of taskIds) {
+    const clickupContext = runtime.queuedStageReconcileContextByTaskId.get(String(taskId)) || null
+    runtime.queuedStageReconcileContextByTaskId.delete(String(taskId))
+    const task = runtime.cache.clickup.tasks.find((item) => String(item.id) === String(taskId))
+    if (!task) continue
+
+    const normalizedPhone = normalizePhone(task.phone)
+    if (normalizedPhone) {
+      const clickupMatches = runtime.cache.clickup.tasks.filter((item) =>
+        phonesMatchLoose(item.phone, normalizedPhone),
+      )
+      const clickupResolution = resolveClickupPhoneConflict(clickupMatches, normalizedPhone)
+
+      if (
+        clickupResolution.canonicalTask?.id &&
+        String(clickupResolution.canonicalTask.id) !== String(taskId)
+      ) {
+        continue
+      }
+    }
+
     const pendingItem = runtime.cache.clickup.pendingContacts.find((item) => item.taskId === taskId)
-    if (!pendingItem) continue
-    if (!pendingItem.bradialContactId) continue
-    if (!['missing_stage_label', 'stage_label_outdated'].includes(pendingItem.syncState)) continue
+    if (pendingItem && pendingItem.syncAllowed === false) continue
+    const leadLink = findLeadLink(taskId, task.phone)
+    const existingLead = findLeadMatchesByPhone(task.phone)[0] || null
+    const hasSyncTarget = Boolean(
+      pendingItem?.bradialContactId ||
+        leadLink?.bradialContactId ||
+        leadLink?.chatContactId ||
+        leadLink?.conversationId ||
+        existingLead,
+    )
+    if (!hasSyncTarget) continue
+
+    const pendingSyncState = String(pendingItem?.syncState || '')
+    const stagePending =
+      ['missing_stage_label', 'stage_label_outdated'].includes(pendingSyncState) ||
+      (BRADIAL_CHAT_AUTO_CREATE_CONVERSATIONS &&
+        pendingSyncState === 'conversation_required_for_stage_label')
+    const taskStateSignature = buildTrackedClickupTaskStateSignature(task)
+
+    if (!stagePending && shouldSuppressClickupReconcile(taskId, taskStateSignature)) {
+      continue
+    }
 
     const queued = enqueueSyncJob({
       taskId,
@@ -351,9 +573,11 @@ async function queueStageReconcile(trigger) {
       refreshBefore: false,
       refreshAfter: false,
       directFetchTask: true,
-      backgroundRefresh: true,
+      backgroundRefresh: !(clickupContext?.isPriorityEvent && !clickupContext?.isStatusEvent),
       controlledStageLabels,
-      reason: pendingItem.syncState,
+      reason: stagePending ? pendingItem.syncState : 'task_state_changed',
+      clickupContext,
+      taskStateSignature,
     })
 
     if (queued.ok) {
@@ -365,11 +589,53 @@ async function queueStageReconcile(trigger) {
     runtime.sync.metrics.reconciled += enqueuedCount
     pushLog(
       'info',
-      'Reconcile de etapa enfileirado',
-      `${enqueuedCount} task(s) foram enviadas para a fila de sync de etapa.`,
+      'Reconcile ClickUp enfileirado',
+      `${enqueuedCount} task(s) com mudancas persistidas foram enviadas para a fila de sync.`,
       { trigger },
     )
   }
+}
+
+function isActionableStagePendingItem(item) {
+  if (!item || item.syncAllowed === false) return false
+
+  return ['missing_stage_label', 'stage_label_outdated'].includes(String(item.syncState || '')) || (
+    BRADIAL_CHAT_AUTO_CREATE_CONVERSATIONS &&
+    String(item.syncState || '') === 'conversation_required_for_stage_label'
+  )
+}
+
+function hasPendingStageTransition(current, previous = null) {
+  if (!isActionableStagePendingItem(current)) return false
+  if (!previous) return false
+
+  return (
+    String(previous.syncState || '') !== String(current.syncState || '') ||
+    String(previous.bradialConversationId || '') !== String(current.bradialConversationId || '') ||
+    String(previous.targetStageLabel || '') !== String(current.targetStageLabel || '') ||
+    !sameNormalizedLabels(previous.currentControlledLabels || [], current.currentControlledLabels || [])
+  )
+}
+
+function collectNewlyActionablePendingStageTasks(nextPendingContacts = [], previousPendingContacts = []) {
+  const previousByTaskId = new Map(
+    (previousPendingContacts || []).map((item) => [String(item?.taskId || ''), item]).filter(([taskId]) => taskId),
+  )
+
+  return (nextPendingContacts || [])
+    .filter((item) => isActionableStagePendingItem(item))
+    .filter((item) => hasPendingStageTransition(item, previousByTaskId.get(String(item.taskId))))
+    .map((item) => ({
+      taskId: item.taskId,
+      clickupContext: {
+        event: 'conversation_stage_backfill',
+        actor: null,
+        field: null,
+        customFieldName: null,
+        isStatusEvent: false,
+        isPriorityEvent: false,
+      },
+    }))
 }
 
 async function overlayConversationStageLabels(bradialSnapshot, trigger = 'manual') {
@@ -568,6 +834,9 @@ async function refreshSnapshot(trigger = 'manual') {
   bradialSnapshot = await overlayConversationStageLabels(bradialSnapshot, trigger)
 
   const previousTaskStateIndex = runtime.clickupTaskStateIndex
+  const previousPendingContacts = Array.isArray(runtime.cache?.clickup?.pendingContacts)
+    ? runtime.cache.clickup.pendingContacts
+    : []
 
   runtime.lastRefreshAt = snapshotAt
   runtime.cache = buildConsolidatedSnapshot({
@@ -578,6 +847,8 @@ async function refreshSnapshot(trigger = 'manual') {
     lastRefreshAt: snapshotAt,
     stageLabelMap: CLICKUP_STAGE_LABEL_MAP,
     controlledStageLabels: getControlledStageLabels(clickupSnapshot.tasks || []),
+    conversationLabelsOnly: !BRADIAL_SYNC_CONTACT_LABELS,
+    autoCreateConversations: BRADIAL_CHAT_AUTO_CREATE_CONVERSATIONS,
   })
   runtime.clickupTaskStateIndex = buildClickupTaskStateIndex(runtime.cache.clickup.tasks)
 
@@ -585,9 +856,13 @@ async function refreshSnapshot(trigger = 'manual') {
     runtime.cache.clickup.tasks,
     previousTaskStateIndex,
   )
+  const newlyActionableStageTasks = collectNewlyActionablePendingStageTasks(
+    runtime.cache.clickup.pendingContacts,
+    previousPendingContacts,
+  )
 
-  if (changedTaskIds.length) {
-    scheduleStageReconcile(changedTaskIds, trigger)
+  if (changedTaskIds.length || newlyActionableStageTasks.length) {
+    scheduleStageReconcile([...changedTaskIds, ...newlyActionableStageTasks], trigger)
   }
 
   pushLog(
@@ -664,10 +939,6 @@ function upsertRuntimeClickupTask(task) {
   }
 
   runtime.cache.clickup.tasks = tasks.sort((left, right) => Number(right.dateUpdated || 0) - Number(left.dateUpdated || 0))
-  runtime.clickupTaskStateIndex.set(String(task.id), {
-    status: String(task.status || '').trim(),
-    phone: normalizePhone(task.phone),
-  })
 }
 
 async function resolveClickupTask(taskId, options = {}) {
@@ -719,7 +990,6 @@ function patchRuntimeClickupTask(updatedTask = {}) {
   runtime.cache.clickup.tasks = tasks.sort(
     (left, right) => Number(right.dateUpdated || 0) - Number(left.dateUpdated || 0),
   )
-  runtime.clickupTaskStateIndex = buildClickupTaskStateIndex(runtime.cache.clickup.tasks)
 
   if (Array.isArray(runtime.cache.clickup.pendingContacts)) {
     runtime.cache.clickup.pendingContacts = runtime.cache.clickup.pendingContacts.map((item) =>
@@ -727,8 +997,14 @@ function patchRuntimeClickupTask(updatedTask = {}) {
         ? {
             ...item,
             status: updatedTask.status || item.status,
+            targetStageLabels:
+              resolveBradialStageLabels(updatedTask, CLICKUP_STAGE_LABEL_MAP) ||
+              item.targetStageLabels ||
+              [],
             stageLabel:
-              CLICKUP_STAGE_LABEL_MAP[normalizeLabelKey(updatedTask.status)] || item.stageLabel || null,
+              resolveBradialStageLabel(updatedTask.status, CLICKUP_STAGE_LABEL_MAP) ||
+              item.stageLabel ||
+              null,
           }
         : item,
     )
@@ -743,6 +1019,8 @@ function patchRuntimeLeadState({
   chatContactId = null,
   conversationId = null,
   clickupStage = null,
+  clickupPriority = undefined,
+  clickupUrgency = undefined,
   bradialLabels = null,
   lastSyncAt = null,
 } = {}) {
@@ -780,6 +1058,8 @@ function patchRuntimeLeadState({
     return {
       ...lead,
       clickupStage: clickupStage || lead.clickupStage,
+      clickupPriority: clickupPriority === undefined ? lead.clickupPriority : clickupPriority,
+      clickupUrgency: clickupUrgency === undefined ? lead.clickupUrgency : clickupUrgency,
       bradialLabels: normalizedLabels || lead.bradialLabels,
       tags: normalizedLabels ? mergeLeadDisplayTags(lead.tags, normalizedLabels) : lead.tags,
       chatContactId: normalizedChatContactId || lead.chatContactId,
@@ -891,6 +1171,19 @@ function sameNormalizedLabels(left = [], right = []) {
   return leftSet.length === rightSet.length && leftSet.every((item, index) => item === rightSet[index])
 }
 
+function selectPrimaryControlledStageLabels(labels = [], controlledStageLabels = []) {
+  const currentControlledLabels = pickControlledLabels(labels, controlledStageLabels)
+  const supplementalKeys = new Set([normalizeLabelKey('confirmado')])
+  const primaryControlledLabels = currentControlledLabels.filter(
+    (label) => !supplementalKeys.has(normalizeLabelKey(label)),
+  )
+
+  return {
+    currentControlledLabels,
+    primaryControlledLabels: primaryControlledLabels.length ? primaryControlledLabels : currentControlledLabels,
+  }
+}
+
 function extractBradialChangedLabels(payload = {}) {
   const changedAttributes = Array.isArray(payload.changed_attributes)
     ? payload.changed_attributes
@@ -913,10 +1206,39 @@ function extractBradialChangedLabels(payload = {}) {
   return []
 }
 
+function extractBradialChangedPriority(payload = {}) {
+  const changedAttributes = Array.isArray(payload.changed_attributes)
+    ? payload.changed_attributes
+    : Array.isArray(payload.changedAttributes)
+      ? payload.changedAttributes
+      : []
+
+  for (const item of changedAttributes) {
+    const key = normalizeLabelKey(
+      item?.key || item?.attribute_key || item?.field || item?.name || '',
+    )
+
+    if (!['priority', 'conversationpriority'].includes(key)) continue
+
+    return {
+      changed: true,
+      priority: normalizeChatPriority(
+        item?.current_value ?? item?.currentValue ?? item?.value ?? item?.new_value ?? item?.newValue ?? null,
+      ),
+    }
+  }
+
+  return {
+    changed: false,
+    priority: null,
+  }
+}
+
 function extractBradialWebhookEnvelope(payload = {}) {
   const conversation =
     payload?.conversation && typeof payload.conversation === 'object' ? payload.conversation : payload
   const sender = conversation?.meta?.sender || payload?.contact || {}
+  const changedPriorityState = extractBradialChangedPriority(payload)
   const changedLabels = extractBradialChangedLabels(payload)
   const labels = changedLabels.length
     ? changedLabels
@@ -945,6 +1267,9 @@ function extractBradialWebhookEnvelope(payload = {}) {
       ) || null,
     labels,
     changedLabels,
+    priority: normalizeChatPriority(conversation?.priority ?? payload?.priority ?? null),
+    changedPriority: changedPriorityState.priority,
+    priorityChanged: changedPriorityState.changed,
     changedAttributes: Array.isArray(payload?.changed_attributes) ? payload.changed_attributes : [],
   }
 }
@@ -957,6 +1282,7 @@ function buildBradialWebhookKey(request, envelope, payload = {}) {
     envelope.event || 'unknown',
     envelope.conversationId || envelope.chatContactId || envelope.phone || 'no-target',
     normalizeWebhookLabels(envelope.labels).join('|') || 'no-labels',
+    envelope.priorityChanged ? envelope.changedPriority ?? 'priority-none' : 'priority-unchanged',
   ].join(':')
 }
 
@@ -967,6 +1293,41 @@ function cleanupStageSyncSuppressions() {
       recentStageSyncSuppressions.delete(key)
     }
   }
+}
+
+function cleanupClickupReconcileSuppressions() {
+  const now = Date.now()
+  for (const [key, value] of recentClickupReconcileSuppressions.entries()) {
+    if (!value || Number(value.expiresAt || 0) <= now) {
+      recentClickupReconcileSuppressions.delete(key)
+    }
+  }
+}
+
+function buildClickupReconcileSuppressionKey(taskId, taskStateSignature) {
+  const normalizedTaskId = String(taskId || '').trim()
+  const normalizedSignature = String(taskStateSignature || '').trim()
+  if (!normalizedTaskId || !normalizedSignature) return null
+  return `${normalizedTaskId}:${normalizedSignature}`
+}
+
+function rememberClickupReconcileSuppression(taskId, taskStateSignature) {
+  const key = buildClickupReconcileSuppressionKey(taskId, taskStateSignature)
+  if (!key) return
+
+  cleanupClickupReconcileSuppressions()
+  recentClickupReconcileSuppressions.set(key, {
+    expiresAt: Date.now() + CLICKUP_RECONCILE_SUPPRESSION_WINDOW_MS,
+  })
+}
+
+function shouldSuppressClickupReconcile(taskId, taskStateSignature) {
+  const key = buildClickupReconcileSuppressionKey(taskId, taskStateSignature)
+  if (!key) return false
+
+  cleanupClickupReconcileSuppressions()
+  const hit = recentClickupReconcileSuppressions.get(key)
+  return Boolean(hit && Number(hit.expiresAt || 0) > Date.now())
 }
 
 function buildStageSyncSuppressionKeys({ taskId = null, conversationId = null, chatContactId = null, label = null } = {}) {
@@ -1024,6 +1385,7 @@ function getSyncJobPriority(source = '') {
   const normalizedSource = String(source || '').trim().toLowerCase()
 
   if (normalizedSource.includes('clickup-integration-webhook')) return 0
+  if (normalizedSource.includes('clickup-api-webhook')) return 0
   if (normalizedSource.includes('stage-reconcile')) return 1
   if (normalizedSource.includes('manual')) return 1
   if (normalizedSource.includes('retry')) return 2
@@ -1068,6 +1430,9 @@ function normalizeSyncJob(input = {}) {
     reason: input.reason || null,
     event: input.event || null,
     integrationId: input.integrationId || null,
+    clickupContext:
+      input.clickupContext && typeof input.clickupContext === 'object' ? input.clickupContext : null,
+    taskStateSignature: String(input.taskStateSignature || '').trim() || null,
     parentJobId: input.parentJobId || null,
   }
 }
@@ -1097,6 +1462,8 @@ function mergeSyncJobs(current, incoming) {
     reason: incoming.reason || current.reason,
     event: incoming.event || current.event,
     integrationId: incoming.integrationId || current.integrationId,
+    clickupContext: incoming.clickupContext || current.clickupContext,
+    taskStateSignature: incoming.taskStateSignature || current.taskStateSignature || null,
     parentJobId: incoming.parentJobId || current.parentJobId,
   }
 }
@@ -1343,18 +1710,38 @@ async function runSyncJob(job) {
       directFetchTask: job.directFetchTask,
       backgroundRefresh: job.backgroundRefresh,
       controlledStageLabels: job.controlledStageLabels,
+      clickupContext: job.clickupContext,
     })
 
     runtime.sync.metrics.processed += 1
     if (result.ok) runtime.sync.metrics.succeeded += 1
 
+    const recoveredWithoutConversation =
+      result.contactOperation === 'create' ||
+      result.contactOperation === 'update' ||
+      result.conversationSync?.contactLabelOperation === 'update' ||
+      result.conversationSync?.reason === 'contact_labels_synced_without_conversation'
+
     const recoveringConversation =
       !result.skipped &&
+      !recoveredWithoutConversation &&
       result.conversationSync?.enabled &&
       result.conversationSync?.reason === 'conversation_not_found'
 
     if (recoveringConversation) {
       scheduleConversationRecovery(job, result)
+    }
+
+    const noopStageReconcile =
+      job.source === 'stage-reconcile' &&
+      job.reason === 'task_state_changed' &&
+      !result.skipped &&
+      result.operation === 'noop' &&
+      result.conversationSync?.operation !== 'update' &&
+      result.metadataSync?.operation !== 'update'
+
+    if (noopStageReconcile && job.taskStateSignature) {
+      rememberClickupReconcileSuppression(job.taskId, job.taskStateSignature)
     }
 
     pushSyncAudit({
@@ -1657,6 +2044,101 @@ function findClickupTaskFromBradialEnvelope(envelope) {
   }
 }
 
+async function enqueueMissingStageLabelSyncFromBradialWebhook(payload, options = {}) {
+  const trigger = String(options.trigger || 'bradial-webhook').trim() || 'bradial-webhook'
+  if (!runtime.lastRefreshAt) {
+    await ensureSnapshot(`${trigger}-bootstrap`)
+  }
+
+  if (!BRADIAL_SYNC_CONVERSATION_LABELS || !bradial.chatEnabled) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: 'conversation_label_sync_disabled',
+    }
+  }
+
+  const envelope = extractBradialWebhookEnvelope(payload)
+  const supportedEvents = ['conversation_created', 'conversation_updated']
+  if (!supportedEvents.includes(envelope.event)) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: 'unsupported_event',
+      event: envelope.event,
+    }
+  }
+
+  const controlledStageLabels = getControlledStageLabels()
+  let labels = normalizeWebhookLabels(envelope.labels)
+
+  if (envelope.conversationId) {
+    try {
+      labels = normalizeWebhookLabels(await bradial.fetchConversationLabels(envelope.conversationId))
+    } catch {}
+  }
+
+  const currentControlledLabels = pickControlledLabels(labels, controlledStageLabels)
+  if (currentControlledLabels.length) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: 'conversation_already_tagged',
+      conversationId: envelope.conversationId,
+      labels: currentControlledLabels,
+    }
+  }
+
+  const located = findClickupTaskFromBradialEnvelope({
+    ...envelope,
+    labels,
+  })
+
+  if (!located.task) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: located.resolution || 'clickup_task_not_found',
+      phone: envelope.phone,
+      conversationId: envelope.conversationId,
+      chatContactId: envelope.chatContactId,
+      matchCount: located.matchCount || 0,
+    }
+  }
+
+  leadLinkStore.upsertLink({
+    taskId: located.task.id,
+    phone: envelope.phone || located.task.phone || null,
+    bradialContactId: located.link?.bradialContactId || null,
+    chatContactId: envelope.chatContactId || located.link?.chatContactId || null,
+    conversationId: envelope.conversationId || located.link?.conversationId || null,
+  })
+
+  const queued = enqueueSyncJob({
+    taskId: located.task.id,
+    dryRun: false,
+    trigger: `${trigger}-stage-backfill`,
+    source: 'bradial-chat-webhook-backfill',
+    refreshBefore: false,
+    refreshAfter: false,
+    directFetchTask: true,
+    backgroundRefresh: true,
+    controlledStageLabels,
+    reason: 'conversation_missing_stage_label',
+  })
+
+  return {
+    ok: queued.ok,
+    skipped: !queued.ok,
+    queued: queued.ok,
+    reason: queued.ok ? 'enqueued' : queued.reason || 'enqueue_failed',
+    taskId: located.task.id,
+    taskName: located.task.name,
+    conversationId: envelope.conversationId,
+    chatContactId: envelope.chatContactId,
+  }
+}
+
 async function syncBradialStageToClickup(payload, options = {}) {
   const trigger = String(options.trigger || 'bradial-webhook').trim() || 'bradial-webhook'
   if (!runtime.lastRefreshAt) {
@@ -1702,7 +2184,10 @@ async function syncBradialStageToClickup(payload, options = {}) {
     }
   }
 
-  const currentControlledLabels = pickControlledLabels(labels, controlledStageLabels)
+  const { currentControlledLabels, primaryControlledLabels } = selectPrimaryControlledStageLabels(
+    labels,
+    controlledStageLabels,
+  )
 
   if (!currentControlledLabels.length) {
     return {
@@ -1714,17 +2199,17 @@ async function syncBradialStageToClickup(payload, options = {}) {
     }
   }
 
-  if (currentControlledLabels.length > 1) {
+  if (primaryControlledLabels.length > 1) {
     return {
       ok: true,
       skipped: true,
       reason: 'ambiguous_bradial_stage_label',
-      labels: currentControlledLabels,
+      labels: primaryControlledLabels,
       conversationId: envelope.conversationId,
     }
   }
 
-  const targetLabel = currentControlledLabels[0]
+  const targetLabel = primaryControlledLabels[0]
   const located = findClickupTaskFromBradialEnvelope({
     ...envelope,
     labels,
@@ -1856,6 +2341,117 @@ async function syncBradialStageToClickup(payload, options = {}) {
   }
 }
 
+async function syncBradialPriorityToClickup(payload, options = {}) {
+  const trigger = String(options.trigger || 'bradial-webhook').trim() || 'bradial-webhook'
+  if (!runtime.lastRefreshAt) {
+    await ensureSnapshot(`${trigger}-bootstrap`)
+  }
+
+  const envelope = extractBradialWebhookEnvelope(payload)
+  const supportedEvents = ['conversation_updated']
+  if (!supportedEvents.includes(envelope.event)) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: 'unsupported_event',
+      event: envelope.event,
+    }
+  }
+
+  if (!envelope.priorityChanged) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: 'no_priority_change',
+      event: envelope.event,
+      conversationId: envelope.conversationId,
+    }
+  }
+
+  const located = findClickupTaskFromBradialEnvelope(envelope)
+  if (!located.task) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: located.resolution || 'clickup_task_not_found',
+      phone: envelope.phone,
+      conversationId: envelope.conversationId,
+      chatContactId: envelope.chatContactId,
+      matchCount: located.matchCount || 0,
+      targetPriority: envelope.changedPriority,
+    }
+  }
+
+  const currentTaskPriority = normalizeChatPriority(located.task.priority)
+  const targetPriority = normalizeChatPriority(envelope.changedPriority)
+
+  if (currentTaskPriority === targetPriority) {
+    return {
+      ok: true,
+      skipped: false,
+      operation: 'noop',
+      taskId: located.task.id,
+      currentPriority: currentTaskPriority,
+      targetPriority,
+      reason: 'already_in_sync',
+    }
+  }
+
+  const updatedTask = await clickup.updateTaskPriority(located.task.id, targetPriority, trigger)
+  patchRuntimeClickupTask(updatedTask)
+  leadLinkStore.upsertLink({
+    taskId: located.task.id,
+    phone: normalizePhone(updatedTask?.phone || envelope.phone || located.task.phone || ''),
+    bradialContactId: located.link?.bradialContactId || null,
+    chatContactId: envelope.chatContactId || located.link?.chatContactId || null,
+    conversationId: envelope.conversationId || located.link?.conversationId || null,
+  })
+
+  pushLog(
+    'success',
+    'Prioridade Bradial -> ClickUp',
+    `${located.task.name} atualizada para prioridade ${targetPriority || 'nenhuma'} a partir do Bradial.`,
+    {
+      taskId: located.task.id,
+      conversationId: envelope.conversationId,
+      chatContactId: envelope.chatContactId,
+      targetPriority,
+      trigger,
+    },
+  )
+
+  pushSyncAudit({
+    type: 'sync_bradial_priority_to_clickup',
+    level: 'success',
+    taskId: located.task.id,
+    trigger,
+    source: 'bradial-chat-webhook',
+    conversationId: envelope.conversationId,
+    chatContactId: envelope.chatContactId,
+    targetPriority,
+  })
+
+  patchRuntimeLeadState({
+    taskId: located.task.id,
+    phone: normalizePhone(updatedTask?.phone || envelope.phone || located.task.phone || ''),
+    chatContactId: envelope.chatContactId || located.link?.chatContactId || null,
+    conversationId: envelope.conversationId || located.link?.conversationId || null,
+    clickupPriority: updatedTask?.priority ?? targetPriority,
+    clickupUrgency: updatedTask?.urgency ?? null,
+    lastSyncAt: new Date().toISOString(),
+  })
+
+  return {
+    ok: true,
+    skipped: false,
+    operation: 'update',
+    taskId: located.task.id,
+    targetPriority,
+    conversationId: envelope.conversationId,
+    chatContactId: envelope.chatContactId,
+  }
+}
+
 async function syncClickupTaskToBradial(taskId, options = {}) {
   const dryRun = Boolean(options.dryRun)
   const trigger = String(options.trigger || 'manual').trim() || 'manual'
@@ -1863,6 +2459,8 @@ async function syncClickupTaskToBradial(taskId, options = {}) {
   const refreshAfter = Boolean(options.refreshAfter)
   const directFetchTask = options.directFetchTask !== false
   const backgroundRefresh = options.backgroundRefresh !== false
+  const clickupContext =
+    options.clickupContext && typeof options.clickupContext === 'object' ? options.clickupContext : null
   const controlledStageLabels = Array.isArray(options.controlledStageLabels)
     ? options.controlledStageLabels
     : getControlledStageLabels()
@@ -1896,23 +2494,22 @@ async function syncClickupTaskToBradial(taskId, options = {}) {
     }
   }
 
-  const statusType = String(task.statusType || '').toLowerCase()
-  if (statusType === 'done' || statusType === 'closed') {
-    return {
-      ok: false,
-      skipped: true,
-      reason: 'terminal_status',
-      taskId,
-      statusType,
-    }
-  }
-
   const clickupMatches = runtime.cache.clickup.tasks.filter(
     (item) => phonesMatchLoose(item.phone, normalizedPhone),
   )
   const clickupResolution = resolveClickupPhoneConflict(clickupMatches, normalizedPhone)
 
   if (clickupResolution.ambiguous) {
+    pushLog(
+      'warning',
+      'Sync ClickUp bloqueado por telefone ambiguo',
+      `${task.name} compartilha telefone com outras tasks ativas no ClickUp e precisa ser saneada antes do sync.`,
+      {
+        taskId,
+        phone: normalizedPhone,
+        matchCount: clickupResolution.activeMatches.length,
+      },
+    )
     return {
       ok: false,
       skipped: true,
@@ -1927,6 +2524,17 @@ async function syncClickupTaskToBradial(taskId, options = {}) {
     clickupResolution.canonicalTask?.id &&
     String(clickupResolution.canonicalTask.id) !== String(taskId)
   ) {
+    pushLog(
+      'info',
+      'Task duplicada do ClickUp suprimida',
+      `${task.name} foi reconhecida como duplicata; a task canonica ${clickupResolution.canonicalTask.id} segue como referencia do telefone.`,
+      {
+        taskId,
+        canonicalTaskId: String(clickupResolution.canonicalTask.id),
+        phone: normalizedPhone,
+        matchCount: clickupResolution.activeMatches.length,
+      },
+    )
     return {
       ok: false,
       skipped: true,
@@ -1945,21 +2553,93 @@ async function syncClickupTaskToBradial(taskId, options = {}) {
     bradialMatches.find((lead) => normalizePhone(lead.phone) === normalizedPhone) ||
     bradialMatches[0] ||
     null
+  const knownConversationId =
+    String(leadLink?.conversationId || existingLead?.conversationId || existingLead?.chatConversationId || '').trim() ||
+    null
+  const knownChatContactId =
+    String(leadLink?.chatContactId || existingLead?.chatContactId || resolveBradialContactId(null, existingLead) || '').trim() ||
+    null
+  const metadataOnly = Boolean(clickupContext?.isPriorityEvent) && !clickupContext?.isStatusEvent
+  const terminalStatus = isClosedOpportunityTask(task, {
+    stageLabelMap: CLICKUP_STAGE_LABEL_MAP,
+    closedStageLabels: CLICKUP_CLOSED_STAGE_LABELS,
+  })
+
+  if (
+    terminalStatus &&
+    !existingLead &&
+    !leadLink?.bradialContactId &&
+    !leadLink?.chatContactId &&
+    !leadLink?.conversationId
+  ) {
+    return {
+      ok: false,
+      skipped: true,
+      reason: 'terminal_status',
+      taskId,
+      statusType: String(task.statusType || '').toLowerCase(),
+    }
+  }
 
   try {
-    const result = await bradial.upsertOpportunityContact(task, existingLead, {
-      dryRun,
-      controlledStageLabels,
-      preferredContactId: leadLink?.bradialContactId || null,
-      preferredChatContactId: leadLink?.chatContactId || null,
-      preferredConversationId: leadLink?.conversationId || null,
-    })
+    const result =
+      metadataOnly && knownConversationId
+        ? {
+            payload: {
+              name: task.name,
+              phoneNumber: normalizedPhone,
+            },
+            contact: existingLead,
+            stageLabel: resolveBradialStageLabel(task.status, CLICKUP_STAGE_LABEL_MAP),
+            previousStageLabels: normalizeWebhookLabels(
+              existingLead?.bradialLabels || existingLead?.raw?.bradialLabels || [],
+            ),
+            conversationSync: {
+              enabled: bradial.chatEnabled,
+              skipped: false,
+              operation: 'noop',
+              conversationId: knownConversationId,
+              knownConversationId,
+              chatContactId: knownChatContactId,
+              labels: normalizeWebhookLabels(existingLead?.bradialLabels || existingLead?.raw?.bradialLabels || []),
+              contactLabels: normalizeWebhookLabels(existingLead?.raw?.bradialLabels || existingLead?.bradialLabels || []),
+              contactLabelOperation: 'noop',
+              conversationLabelOperation: 'noop',
+            },
+            metadataSync: await bradial.syncLinkedConversationMetadata(task, {
+              conversationId: knownConversationId,
+              chatContactId: knownChatContactId,
+              clickupContext,
+              chatAgents: runtime.cache.chatAgents || [],
+              dryRun,
+            }),
+          }
+        : await bradial.upsertOpportunityContact(task, existingLead, {
+            dryRun,
+            allowCreate: !terminalStatus,
+            controlledStageLabels,
+            preferredContactId: leadLink?.bradialContactId || null,
+            preferredChatContactId: leadLink?.chatContactId || null,
+            preferredConversationId: leadLink?.conversationId || null,
+            chatAgents: runtime.cache.chatAgents || [],
+            clickupContext,
+          })
+
+    if (metadataOnly && knownConversationId) {
+      result.operation = result.metadataSync?.operation === 'update' ? 'update' : 'noop'
+    }
 
     if (!dryRun) {
       const canonicalContactId =
         result.consolidatedChatContact?.contactId ||
         result.conversationSync?.chatContactId ||
         resolveBradialContactId(result.contact, existingLead)
+      const runtimeStageLabels =
+        Array.isArray(result.conversationSync?.labels) && result.conversationSync.conversationId
+          ? result.conversationSync.labels
+          : BRADIAL_SYNC_CONTACT_LABELS && Array.isArray(result.conversationSync?.contactLabels)
+            ? result.conversationSync.contactLabels
+            : null
 
       if (result.consolidatedChatContact?.mergedIds?.length && canonicalContactId) {
         leadLinkStore.rebindContactIds({
@@ -1990,7 +2670,9 @@ async function syncClickupTaskToBradial(taskId, options = {}) {
         chatContactId: canonicalContactId || leadLink?.chatContactId || null,
         conversationId: result.conversationSync?.conversationId || leadLink?.conversationId || null,
         clickupStage: task.status,
-        bradialLabels: [result.stageLabel],
+        clickupPriority: task.priority,
+        clickupUrgency: task.urgency,
+        bradialLabels: runtimeStageLabels,
       })
 
       runtime.cache.clickup.pendingContacts = (runtime.cache.clickup.pendingContacts || []).filter(
@@ -2015,12 +2697,37 @@ async function syncClickupTaskToBradial(taskId, options = {}) {
         bradialContactId: resolveBradialContactId(result.contact, existingLead),
         bradialConversationId: result.conversationSync?.conversationId || null,
         conversationOperation: result.conversationSync?.operation || null,
+        metadataOperation: result.metadataSync?.operation || null,
       },
     )
 
-    if (!dryRun && refreshAfter) {
+    if (result.metadataSync?.assignmentOperation === 'unmatched') {
+      pushLog(
+        'warning',
+        'Responsavel ClickUp sem agente Bradial',
+        `${task.name} nao encontrou agente correspondente para o responsavel atual do ClickUp.`,
+        {
+          taskId,
+          phone: normalizedPhone,
+          owner: task.owner || null,
+          ownerEmail: task.ownerEmail || null,
+          assignees: task.assignees || [],
+          matchReason: result.metadataSync?.matchReason || 'no_match',
+        },
+      )
+    }
+
+    const shouldRefreshAfterSync =
+      result.operation !== 'noop' ||
+      result.contactOperation === 'create' ||
+      result.contactOperation === 'update' ||
+      result.conversationSync?.operation === 'create' ||
+      result.conversationSync?.operation === 'update' ||
+      result.metadataSync?.operation === 'update'
+
+    if (!dryRun && refreshAfter && shouldRefreshAfterSync) {
       await refreshSnapshot(`${trigger}-${taskId}`)
-    } else if (!dryRun && backgroundRefresh) {
+    } else if (!dryRun && backgroundRefresh && shouldRefreshAfterSync) {
       scheduleDeferredSnapshotRefresh(`${trigger}-deferred`)
     }
 
@@ -2036,6 +2743,7 @@ async function syncClickupTaskToBradial(taskId, options = {}) {
       stageLabel: result.stageLabel,
       previousStageLabels: result.previousStageLabels || [],
       conversationSync: result.conversationSync || null,
+      metadataSync: result.metadataSync || null,
       bradialContactId: resolveBradialContactId(result.contact, existingLead),
       bradialContactName: result.contact?.name || existingLead?.name || null,
       payload: result.payload,
@@ -2050,7 +2758,8 @@ async function syncClickupTaskToBradial(taskId, options = {}) {
   }
 }
 
-function enqueuePendingSyncCandidates(trigger = 'reconcile-interval') {
+function enqueuePendingSyncCandidates(trigger = 'reconcile-interval', limit = SYNC_RECONCILE_BATCH_SIZE) {
+  const batchLimit = Math.max(1, Number(limit || SYNC_RECONCILE_BATCH_SIZE))
   const queueBusy =
     runtime.sync.queue.length > 0 ||
     runtime.sync.activeByTaskId.size > 0 ||
@@ -2070,11 +2779,13 @@ function enqueuePendingSyncCandidates(trigger = 'reconcile-interval') {
   const candidates = (runtime.cache.clickup.pendingContacts || [])
     .filter((item) => {
       if (!item.syncAllowed) return false
-      return ['missing_contact', 'missing_stage_label', 'stage_label_outdated'].includes(
-        String(item.syncState || ''),
+      const syncState = String(item.syncState || '')
+      return ['missing_contact', 'missing_stage_label', 'stage_label_outdated'].includes(syncState) || (
+        BRADIAL_CHAT_AUTO_CREATE_CONVERSATIONS &&
+        syncState === 'conversation_required_for_stage_label'
       )
     })
-    .slice(0, SYNC_RECONCILE_BATCH_SIZE)
+    .slice(0, batchLimit)
 
   let queuedCount = 0
 
@@ -2106,6 +2817,12 @@ function enqueuePendingSyncCandidates(trigger = 'reconcile-interval') {
   return queuedCount
 }
 
+app.get('/healthz', async () => ({
+  status: 'ok',
+  source: 'bradial-clickup-sync-backend',
+  started: true,
+}))
+
 app.get('/health', async () => {
   if (!runtime.lastRefreshAt) {
     await ensureSnapshot('health-bootstrap')
@@ -2129,6 +2846,9 @@ app.get('/health', async () => {
       opportunityLabel: BRADIAL_OPPORTUNITY_LABEL,
       chatSyncEnabled: bradial.chatEnabled,
       contactLabelSyncEnabled: BRADIAL_SYNC_CONTACT_LABELS,
+      stageLabelScope: BRADIAL_STAGE_LABEL_SCOPE,
+      conversationAssignmentSyncEnabled: BRADIAL_SYNC_CONVERSATION_ASSIGNMENT,
+      conversationAutoCreateEnabled: BRADIAL_CHAT_AUTO_CREATE_CONVERSATIONS,
       chatBaseUrl: process.env.BRADIAL_CHAT_BASE_URL || null,
       chatAccountId: process.env.BRADIAL_CHAT_ACCOUNT_ID || process.env.BRADIAL_ACCOUNT_ID || null,
       chatInboxId: process.env.BRADIAL_CHAT_INBOX_ID || null,
@@ -2186,7 +2906,8 @@ app.get('/events', async (request, reply) => {
     'Cache-Control': 'no-cache, no-transform',
     Connection: 'keep-alive',
     'X-Accel-Buffering': 'no',
-    'Access-Control-Allow-Origin': FRONTEND_ORIGIN,
+    'Access-Control-Allow-Origin': resolveSseAllowedOrigin(request),
+    Vary: 'Origin',
   })
 
   reply.raw.write(
@@ -2225,17 +2946,27 @@ app.get('/sync/audit', async (request) => {
   return syncAuditStore.listRecent(limit)
 })
 
-app.post('/sync/reconcile', async () => {
-  const queuedCount = enqueuePendingSyncCandidates('manual-reconcile')
+app.post('/sync/reconcile', async (request) => {
+  const limit = Math.max(
+    1,
+    Number(request.query?.limit || request.body?.limit || SYNC_RECONCILE_BATCH_SIZE),
+  )
+  const queuedCount = enqueuePendingSyncCandidates('manual-reconcile', limit)
   return {
     ok: true,
     queuedCount,
+    limit,
   }
 })
 
 app.get('/agents', async () => {
   if (!runtime.lastRefreshAt) await ensureSnapshot('agents-bootstrap')
   return runtime.cache.agents
+})
+
+app.get('/chat/agents', async () => {
+  if (!runtime.lastRefreshAt) await ensureSnapshot('chat-agents-bootstrap')
+  return runtime.cache.chatAgents || []
 })
 
 app.get('/inboxes', async () => {
@@ -2334,7 +3065,7 @@ app.patch('/clickup/webhook-integrations/:integrationId', async (request, reply)
 app.post('/clickup/tasks/:taskId/sync-to-bradial', async (request, reply) => {
   const taskId = String(request.params.taskId || '').trim()
   const dryRun = parseBooleanFlag(request.query?.dryRun || request.body?.dryRun)
-  const result = await syncClickupTaskToBradial(taskId, {
+  let result = await syncClickupTaskToBradial(taskId, {
     dryRun,
     trigger: 'manual-endpoint',
   })
@@ -2370,6 +3101,33 @@ app.post('/clickup/tasks/:taskId/sync-to-bradial', async (request, reply) => {
     }
 
     if (result.reason === 'suppressed_clickup_duplicate') {
+      if (result.canonicalTaskId) {
+        pushLog(
+          'info',
+          'Sync manual redirecionado para task canonica',
+          `Task ${taskId} foi reconhecida como duplicata; a task canonica ${result.canonicalTaskId} sera priorizada.`,
+          {
+            taskId,
+            canonicalTaskId: result.canonicalTaskId,
+            phone: result.phone,
+          },
+        )
+
+        const canonicalResult = await syncClickupTaskToBradial(result.canonicalTaskId, {
+          dryRun,
+          trigger: 'manual-endpoint-canonical',
+        })
+
+        return {
+          ...canonicalResult,
+          requestedTaskId: taskId,
+          followedCanonicalTaskId: result.canonicalTaskId,
+          duplicateTaskSuppressed: true,
+          message:
+            'Task duplicada detectada; a sincronizacao foi executada usando a task canonica do mesmo telefone.',
+        }
+      }
+
       return {
         ok: true,
         skipped: true,
@@ -2435,7 +3193,7 @@ app.post('/webhooks/clickup', async (request, reply) => {
   })
 
   queueMicrotask(() => {
-    if (!['taskCreated', 'taskUpdated', 'taskStatusUpdated'].includes(event)) {
+    if (!['taskCreated', 'taskUpdated', 'taskStatusUpdated', 'taskPriorityUpdated', 'taskAssigneeUpdated'].includes(event)) {
       pushLog('info', 'Webhook ClickUp ignorado', `Evento ${event} fora do escopo de sync.`, {
         event,
       })
@@ -2449,6 +3207,12 @@ app.post('/webhooks/clickup', async (request, reply) => {
       return
     }
 
+    const clickupContext = extractClickupWebhookContext(payload, {
+      urgencyFieldNames: CLICKUP_URGENCY_FIELD_NAMES,
+      stageLabelMap: CLICKUP_STAGE_LABEL_MAP,
+      closedStageLabels: CLICKUP_CLOSED_STAGE_LABELS,
+    })
+
     enqueueSyncJob({
       taskId,
       dryRun: false,
@@ -2457,8 +3221,9 @@ app.post('/webhooks/clickup', async (request, reply) => {
       refreshBefore: false,
       refreshAfter: false,
       directFetchTask: true,
-      backgroundRefresh: true,
+      backgroundRefresh: !clickupContext.isPriorityEvent,
       event,
+      clickupContext,
     })
   })
 
@@ -2521,7 +3286,14 @@ app.post('/webhooks/clickup/:integrationId/:webhookToken', async (request, reply
   })
 
   queueMicrotask(() => {
-    const supportedEvents = ['taskCreated', 'taskUpdated', 'taskStatusUpdated', 'automation_call_webhook']
+    const supportedEvents = [
+      'taskCreated',
+      'taskUpdated',
+      'taskStatusUpdated',
+      'taskPriorityUpdated',
+      'taskAssigneeUpdated',
+      'automation_call_webhook',
+    ]
 
     if (!supportedEvents.includes(event)) {
       pushLog('info', 'Webhook ClickUp ignorado', `Evento ${event} fora do escopo de sync.`, {
@@ -2539,6 +3311,12 @@ app.post('/webhooks/clickup/:integrationId/:webhookToken', async (request, reply
       return
     }
 
+    const clickupContext = extractClickupWebhookContext(payload, {
+      urgencyFieldNames: CLICKUP_URGENCY_FIELD_NAMES,
+      stageLabelMap: CLICKUP_STAGE_LABEL_MAP,
+      closedStageLabels: CLICKUP_CLOSED_STAGE_LABELS,
+    })
+
     enqueueSyncJob({
       taskId,
       dryRun: false,
@@ -2547,9 +3325,10 @@ app.post('/webhooks/clickup/:integrationId/:webhookToken', async (request, reply
       refreshBefore: false,
       refreshAfter: false,
       directFetchTask: true,
-      backgroundRefresh: true,
+      backgroundRefresh: !clickupContext.isPriorityEvent,
       event,
       integrationId: integration.integrationId,
+      clickupContext,
     })
   })
 
@@ -2590,6 +3369,36 @@ app.post('/webhooks/bradial/chatwoot', async (request, reply) => {
   })
 
   queueMicrotask(() => {
+    void enqueueMissingStageLabelSyncFromBradialWebhook(payload, {
+      trigger: `bradial-chat-webhook-${envelope.event || 'unknown'}`,
+    })
+      .then((result) => {
+        if (result?.queued) {
+          pushLog(
+            'info',
+            'Backfill de etiqueta enfileirado',
+            `${result.taskName || `Task ${result.taskId}`} entrou na fila para aplicar a etiqueta atual do ClickUp na conversa.`,
+            {
+              taskId: result.taskId,
+              conversationId: result.conversationId,
+              chatContactId: result.chatContactId,
+            },
+          )
+        }
+      })
+      .catch((error) => {
+        pushLog(
+          'warning',
+          'Falha ao enfileirar backfill de etiqueta',
+          error.message,
+          {
+            event: envelope.event,
+            conversationId: envelope.conversationId,
+            chatContactId: envelope.chatContactId,
+          },
+        )
+      })
+
     void syncBradialStageToClickup(payload, {
       trigger: `bradial-chat-webhook-${envelope.event || 'unknown'}`,
     })
@@ -2628,6 +3437,30 @@ app.post('/webhooks/bradial/chatwoot', async (request, reply) => {
           error: error.message,
         })
       })
+
+    void syncBradialPriorityToClickup(payload, {
+      trigger: `bradial-chat-webhook-priority-${envelope.event || 'unknown'}`,
+    }).catch((error) => {
+      pushLog(
+        'error',
+        'Falha no sync de prioridade Bradial -> ClickUp',
+        error.message,
+        {
+          event: envelope.event,
+          conversationId: envelope.conversationId,
+          chatContactId: envelope.chatContactId,
+        },
+      )
+      pushSyncAudit({
+        type: 'sync_bradial_priority_to_clickup_failed',
+        level: 'error',
+        trigger: `bradial-chat-webhook-priority-${envelope.event || 'unknown'}`,
+        source: 'bradial-chat-webhook',
+        conversationId: envelope.conversationId,
+        chatContactId: envelope.chatContactId,
+        error: error.message,
+      })
+    })
   })
 
   return reply

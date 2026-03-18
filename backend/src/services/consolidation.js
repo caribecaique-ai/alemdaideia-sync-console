@@ -4,6 +4,7 @@ import {
   labelsIncludeEquivalent,
   pickControlledLabels,
   resolveBradialStageLabel,
+  resolveBradialStageLabels,
 } from './clickupStageLabels.js'
 
 function buildBradialExceptions(leads, snapshotAt) {
@@ -83,9 +84,53 @@ function pickBestTask(tasks) {
   })[0]
 }
 
-function hasStageLabel(lead, targetLabel) {
-  if (!targetLabel) return false
-  return labelsIncludeEquivalent(lead?.bradialLabels || lead?.raw?.bradialLabels || [], targetLabel)
+function resolvePreferredClickupTask(matchingTasks = []) {
+  if (!Array.isArray(matchingTasks) || !matchingTasks.length) {
+    return {
+      task: null,
+      ambiguous: false,
+      activeMatchCount: 0,
+      suppressedTaskIds: [],
+    }
+  }
+
+  const activeTasks = matchingTasks.filter((task) => isActiveClickupTask(task))
+  if (!activeTasks.length) {
+    return {
+      task: pickBestTask(matchingTasks) || null,
+      ambiguous: false,
+      activeMatchCount: 0,
+      suppressedTaskIds: [],
+    }
+  }
+
+  const normalizedPhone = normalizePhone(activeTasks[0]?.phone)
+  const resolution = resolveClickupPhoneConflict(activeTasks, normalizedPhone)
+
+  if (resolution.ambiguous) {
+    return {
+      task: null,
+      ambiguous: true,
+      activeMatchCount: activeTasks.length,
+      suppressedTaskIds: [],
+    }
+  }
+
+  return {
+    task: resolution.canonicalTask || pickBestTask(activeTasks) || null,
+    ambiguous: false,
+    activeMatchCount: activeTasks.length,
+    suppressedTaskIds: resolution.suppressedTaskIds || [],
+  }
+}
+
+function hasStageLabels(lead, targetLabels = []) {
+  const effectiveTargetLabels = (targetLabels || []).filter(Boolean)
+  if (!effectiveTargetLabels.length) return false
+
+  return effectiveTargetLabels.every((targetLabel) =>
+    labelsIncludeEquivalent(lead?.bradialLabels || lead?.raw?.bradialLabels || [], targetLabel),
+  )
 }
 
 function normalizeLeadPhone(value) {
@@ -180,6 +225,8 @@ function mergeLeadGroup(group) {
     email: choosePreferredValue(sorted, (lead) => lead.email, preferredLead.email),
     clickupTaskId: choosePreferredValue(sorted, (lead) => lead.clickupTaskId),
     clickupStage: choosePreferredValue(sorted, (lead) => lead.clickupStage),
+    clickupPriority: choosePreferredValue(sorted, (lead) => lead.clickupPriority),
+    clickupUrgency: choosePreferredValue(sorted, (lead) => lead.clickupUrgency),
     clickupTaskUrl: choosePreferredValue(sorted, (lead) => lead.clickupTaskUrl),
     clickupWorkspace: choosePreferredValue(sorted, (lead) => lead.clickupWorkspace),
     clickupListName: choosePreferredValue(sorted, (lead) => lead.clickupListName),
@@ -241,27 +288,34 @@ function consolidateLeads(leads) {
 }
 
 function enrichLead(lead, matchingTasks, clickupSnapshot) {
-  const bestTask = matchingTasks.length ? pickBestTask(matchingTasks) : null
+  const preferredTask = resolvePreferredClickupTask(matchingTasks)
+  const bestTask = preferredTask.task
   const tags = new Set(Array.isArray(lead.tags) ? lead.tags : [])
 
   if (bestTask) tags.add('clickup_match')
   if (!bestTask && clickupSnapshot?.enabled) tags.add('clickup_pending')
+  if (preferredTask.ambiguous) tags.add('clickup_ambiguous_phone')
+  if ((preferredTask.suppressedTaskIds || []).length) tags.add('clickup_duplicate_suppressed')
 
   let summary = lead.summary
   if (bestTask) {
     summary = `${lead.summary} Match ClickUp: ${bestTask.name}.`
+  } else if (preferredTask.ambiguous) {
+    summary = `${lead.summary} Telefone ambiguo no ClickUp; lead mantido sem task canonica vinculada.`
   }
 
   return {
     ...lead,
     clickupTaskId: bestTask?.id || null,
     clickupStage: bestTask?.status || null,
+    clickupPriority: bestTask?.priority || null,
+    clickupUrgency: bestTask?.urgency || null,
     clickupTaskUrl: bestTask?.url || null,
     clickupWorkspace: clickupSnapshot?.workspace?.name || null,
     clickupListName: bestTask?.listName || null,
     clickupPhoneMatched: bestTask?.phone || null,
     owner: bestTask?.owner || lead.owner,
-    health: matchingTasks.length > 1 ? 'risk' : bestTask ? 'healthy' : lead.health,
+    health: preferredTask.ambiguous || matchingTasks.length > 1 ? 'risk' : bestTask ? 'healthy' : lead.health,
     tags: [...tags],
     summary,
     lastAction: bestTask ? 'match clickup por telefone' : lead.lastAction,
@@ -269,6 +323,7 @@ function enrichLead(lead, matchingTasks, clickupSnapshot) {
     raw: {
       ...lead.raw,
       clickupTaskId: bestTask?.id || null,
+      suppressedClickupTaskIds: preferredTask.suppressedTaskIds || [],
     },
   }
 }
@@ -319,7 +374,10 @@ function buildPendingClickupContacts(
   stageLabelMap,
   controlledStageLabels,
   rawLeads = leads,
+  options = {},
 ) {
+  const conversationLabelsOnly = options.conversationLabelsOnly === true
+  const autoCreateConversations = options.autoCreateConversations === true
   const bradialIndex = new Map()
   const rawBradialIndex = new Map()
 
@@ -357,8 +415,11 @@ function buildPendingClickupContacts(
 
       const bradialMatches = phone ? rawBradialIndex.get(phone) || [] : []
       const matchedLead = phone ? (bradialIndex.get(phone) || [])[0] || null : null
+      const matchedConversationId =
+        String(matchedLead?.conversationId || matchedLead?.chatConversationId || '').trim() || null
       const targetStageLabel = resolveBradialStageLabel(task.status, stageLabelMap)
-      const alreadyTagged = matchedLead ? hasStageLabel(matchedLead, targetStageLabel) : false
+      const targetStageLabels = resolveBradialStageLabels(task, stageLabelMap)
+      const alreadyTagged = matchedLead ? hasStageLabels(matchedLead, targetStageLabels) : false
       const currentControlledLabels = matchedLead
         ? pickControlledLabels(
             matchedLead?.bradialLabels || matchedLead?.raw?.bradialLabels || [],
@@ -379,13 +440,19 @@ function buildPendingClickupContacts(
       } else if (!matchedLead) {
         syncState = 'missing_contact'
         syncAllowed = true
-        summary = `Task pronta para criar um novo contato no Bradial com a tag ${targetStageLabel || 'de etapa'}.`
+        summary = `Task pronta para criar um novo contato no Bradial com a tag ${targetStageLabels.join(', ') || targetStageLabel || 'de etapa'}.`
+      } else if (conversationLabelsOnly && !matchedConversationId) {
+        syncState = 'conversation_required_for_stage_label'
+        syncAllowed = autoCreateConversations
+        summary = autoCreateConversations
+          ? 'Contato encontrado no Bradial sem conversa vinculada; o sistema pode iniciar uma conversa vazia automaticamente para aplicar a etiqueta e o responsavel.'
+          : 'Contato encontrado no Bradial, mas ainda sem conversa vinculada para sincronizar a etiqueta de etapa.'
       } else if (!alreadyTagged) {
         syncState = currentControlledLabels.length ? 'stage_label_outdated' : 'missing_stage_label'
         syncAllowed = true
         summary = currentControlledLabels.length
-          ? `Contato encontrado no Bradial com tag de etapa ${currentControlledLabels.join(', ')}, mas a etapa atual do ClickUp exige ${targetStageLabel}.`
-          : `Contato encontrado no Bradial, mas ainda sem a tag de etapa ${targetStageLabel}.`
+          ? `Contato encontrado no Bradial com tag de etapa ${currentControlledLabels.join(', ')}, mas a etapa atual do ClickUp exige ${targetStageLabels.join(', ') || targetStageLabel}.`
+          : `Contato encontrado no Bradial, mas ainda sem a tag de etapa ${targetStageLabels.join(', ') || targetStageLabel}.`
       }
 
       if (!syncState) return null
@@ -399,15 +466,19 @@ function buildPendingClickupContacts(
         owner: task.owner || null,
         status: task.status,
         statusType: task.statusType,
+        priority: task.priority || null,
+        urgency: task.urgency || null,
         listName: task.listName,
         url: task.url || null,
         dateUpdated: task.dateUpdated || null,
         bradialLeadId: matchedLead?.id || null,
         bradialContactId: matchedLead?.chatContactId || null,
+        bradialConversationId: matchedConversationId,
         bradialContactName: matchedLead?.name || null,
         bradialLabels: matchedLead?.bradialLabels || matchedLead?.raw?.bradialLabels || [],
         currentControlledLabels,
         targetStageLabel,
+        targetStageLabels,
         bradialMatchCount: bradialMatches.length,
         clickupMatchCount: activeClickupMatches.length,
         syncState,
@@ -427,6 +498,8 @@ export function buildConsolidatedSnapshot({
   lastRefreshAt,
   stageLabelMap,
   controlledStageLabels,
+  conversationLabelsOnly = false,
+  autoCreateConversations = false,
 }) {
   const taskIndex = new Map()
   const snapshotAt = lastRefreshAt || new Date().toISOString()
@@ -452,6 +525,7 @@ export function buildConsolidatedSnapshot({
     stageLabelMap,
     controlledStageLabels,
     leads,
+    { conversationLabelsOnly, autoCreateConversations },
   )
 
   const exceptions = [
@@ -464,6 +538,7 @@ export function buildConsolidatedSnapshot({
       leads: consolidatedLeads,
       exceptions,
       agents: bradialSnapshot?.agents || [],
+      chatAgents: bradialSnapshot?.chatAgents || [],
       inboxes: bradialSnapshot?.inboxes || [],
       clickupSnapshot: {
         ...clickupSnapshot,
@@ -476,6 +551,7 @@ export function buildConsolidatedSnapshot({
     leads: consolidatedLeads,
     exceptions,
     agents: bradialSnapshot?.agents || [],
+    chatAgents: bradialSnapshot?.chatAgents || [],
     inboxes: bradialSnapshot?.inboxes || [],
     clickup: {
       health: buildClickupHealth({

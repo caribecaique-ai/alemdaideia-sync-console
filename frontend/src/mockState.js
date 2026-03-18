@@ -5,6 +5,7 @@ function minutesAgo(minutes) {
 export const initialConfig = {
   mode: 'live',
   backendUrl: 'http://168.231.97.169:3015',
+  adminApiToken: '',
   bradialBaseUrl: 'https://chat.bradial.com.br',
   bradialAccountId: '6008',
   autoPoll: false,

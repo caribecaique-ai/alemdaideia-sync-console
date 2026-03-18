@@ -19,6 +19,8 @@ Projeto local para consolidar dados da Bradial com o ClickUp do workspace `Alem 
 - cria ou atualiza contato no Bradial sem enviar mensagem
 - espelha a etapa do ClickUp em uma tag controlada no Bradial, removendo a tag de etapa anterior
 - permite sync reverso de etapa via webhook do Bradial/Chat para atualizar o status no ClickUp
+- sincroniza urgencia do ClickUp para a prioridade nativa da conversa no Bradial/Chat
+- registra o fechador vindo do webhook oficial do ClickUp e pode atribuir a conversa ao agente correspondente no chat
 - gera URL por integracao para cadastro de webhook no ClickUp
 
 ## Seguranca
@@ -52,12 +54,18 @@ Variaveis principais:
 - `BRADIAL_CHAT_INBOX_ID`
 - `BRADIAL_CHAT_WEBHOOK_SECRET`
 - `BRADIAL_OPPORTUNITY_LABEL`
+- `BRADIAL_SYNC_CONVERSATION_PRIORITY`
+- `BRADIAL_SYNC_CLOSED_BY_ASSIGNMENT`
+- `BRADIAL_SYNC_CLOSED_BY_ATTRIBUTES`
+- `BRADIAL_AGENT_ALIAS_MAP`
 - `PUBLIC_BASE_URL`
 - `CLICKUP_API_KEY`
 - `CLICKUP_WORKSPACE_NAME`
 - `CLICKUP_COMMERCIAL_SPACE_NAME`
 - `CLICKUP_COMMERCIAL_FOLDER_NAME`
 - `CLICKUP_STAGE_LABEL_MAP`
+- `CLICKUP_URGENCY_FIELD_NAMES`
+- `CLICKUP_CLOSED_STAGE_LABELS`
 - `CLICKUP_WEBHOOK_SECRET`
 - `CLICKUP_INTEGRATIONS_PATH`
 
@@ -121,6 +129,7 @@ cd ops
 - `GET /clickup/health`
 - `GET /clickup/navigation`
 - `GET /clickup/tasks`
+- `GET /chat/agents`
 - `GET /clickup/pending-contacts`
 - `GET /clickup/webhook-integrations`
 - `POST /clickup/webhook-integrations`
@@ -149,3 +158,44 @@ Fluxo recomendado:
 5. subir o backend com `pm2`
 6. apontar o `nginx` para `frontend/dist` e para `localhost:3015`
 7. trocar `PUBLIC_BASE_URL` e os webhooks para o domínio final
+
+## Migracao de Chatwoot
+
+Kit de migracao preparado em `ops/`:
+
+- `ops/CHATWOOT_MIGRATION_RUNBOOK.md`
+- `ops/chatwoot-migration-backup.sh`
+- `ops/chatwoot-migration-readiness.sh`
+- `ops/chatwoot-migration-sanitize-links.sh`
+- `ops/chatwoot-migration-backfill.sh`
+- `ops/vps-full-check.sh`
+- `ops/VPS_FULL_CHECK.md`
+
+Observacao:
+- com `BRADIAL_STAGE_LABEL_SCOPE=conversation`, contato sem conversa nao recebe etiqueta de etapa.
+
+## Match de agentes
+
+Para atribuir no Bradial quem fechou no ClickUp, o backend usa os membros do inbox do chat e tenta casar nesta ordem:
+
+- email do usuario do ClickUp
+- nome normalizado do usuario do ClickUp
+- alias manual via `BRADIAL_AGENT_ALIAS_MAP`
+
+Exemplo:
+
+```env
+BRADIAL_AGENT_ALIAS_MAP={"abimael bueno":"abimael.bueno@hotmail.com","diego stev":"diego@seudominio.com"}
+```
+
+## Mapa de urgencia
+
+O sync de urgencia usa a prioridade nativa da conversa no Bradial/Chat:
+
+- ClickUp `Urgente` -> Bradial `Urgente`
+- ClickUp `Alta` -> Bradial `Alta`
+- ClickUp `Normal` -> Bradial `Media`
+- ClickUp `Baixa` -> Bradial `Baixa`
+- ClickUp `Limpar` -> Bradial `Nenhuma`
+
+Se a urgencia estiver em campo personalizado, configure `CLICKUP_URGENCY_FIELD_NAMES`.

@@ -2,17 +2,50 @@ import { normalizeText } from '../utils/normalizers.js'
 
 const DEFAULT_CLICKUP_STAGE_LABEL_MAP = {
   oportunidade: 'oportunidade',
-  'em qualificação': 'qualificacao',
-  'reunião agendada': 'reuniao-agendada',
+  'em qualificacao': 'qualificacao',
+  'em-qualificacao': 'qualificacao',
+  'reuniao agendada': 'reuniao-agendada',
+  'reuniao-agendada': 'reuniao-agendada',
   followup: 'follow-up',
+  'follow-up': 'follow-up',
   'convidado para o evento': 'convidado-evento',
+  'convidado-para-o-evento': 'convidado-evento',
+  'convidado-evento': 'convidado-evento',
   confirmado: 'confirmado',
   compareceu: 'compareceu',
-  'em negociação': 'em-negociacao',
-  'negócio fechado': 'negocio-fechado',
+  'em negociacao': 'em-negociacao',
+  'em-negociacao': 'em-negociacao',
+  'negocio fechado': 'negocio-fechado',
+  'negocio-fechado': 'negocio-fechado',
   desqualificado: 'desqualificado',
   perdido: 'perdido',
 }
+
+const LEGACY_CLICKUP_LABEL_STATUS_MAP = {
+  'em qualificacao': 'em qualifica\u00e7\u00e3o',
+  'em-qualificacao': 'em qualifica\u00e7\u00e3o',
+  qualificacao: 'em qualifica\u00e7\u00e3o',
+  'reuniao agendada': 'reuni\u00e3o agendada',
+  'reuniao-agendada': 'reuni\u00e3o agendada',
+  'follow-up': 'followup',
+  'convidado para o evento': 'convidado para o evento',
+  'convidado-para-o-evento': 'convidado para o evento',
+  'convidado-evento': 'convidado para o evento',
+  'em negociacao': 'em negocia\u00e7\u00e3o',
+  'em-negociacao': 'em negocia\u00e7\u00e3o',
+  'negocio fechado': 'negocio fechado',
+  'negocio-fechado': 'negocio fechado',
+}
+
+const LEGACY_CONTROLLED_STAGE_LABELS = [
+  'em qualificacao',
+  'em-qualificacao',
+  'reuniao agendada',
+  'convidado para o evento',
+  'convidado-para-o-evento',
+  'em negociacao',
+  'negocio fechado',
+]
 
 export function normalizeLabelKey(value) {
   return normalizeText(value).replace(/[_\-\s]+/g, '')
@@ -67,6 +100,13 @@ export function buildLabelStatusMap(overrides = null) {
     map.set(normalizedLabel, normalizedStatus)
   }
 
+  for (const [label, status] of Object.entries(LEGACY_CLICKUP_LABEL_STATUS_MAP)) {
+    const normalizedLabel = normalizeLabelKey(label)
+    const normalizedStatus = String(status || '').trim()
+    if (!normalizedLabel || !normalizedStatus) continue
+    map.set(normalizedLabel, normalizedStatus)
+  }
+
   return map
 }
 
@@ -76,6 +116,27 @@ export function resolveBradialStageLabel(status, stageLabelMap = null) {
 
   const map = stageLabelMap instanceof Map ? stageLabelMap : buildStageLabelMap(stageLabelMap)
   return map.get(normalizedStatus) || toBradialLabelFallback(status)
+}
+
+export function resolveBradialStageLabels(taskOrStatus, stageLabelMap = null, options = {}) {
+  const task =
+    taskOrStatus && typeof taskOrStatus === 'object' && !Array.isArray(taskOrStatus)
+      ? taskOrStatus
+      : null
+  const status = task ? task.status : taskOrStatus
+  const confirmedLabel = String(options.confirmedLabel || 'confirmado').trim() || 'confirmado'
+  const labels = []
+  const primaryLabel = resolveBradialStageLabel(status, stageLabelMap)
+
+  if (primaryLabel) {
+    labels.push(primaryLabel)
+  }
+
+  if (task?.eventInviteConfirmed) {
+    labels.push(confirmedLabel)
+  }
+
+  return [...new Map(labels.map((label) => [normalizeLabelKey(label), label])).values()]
 }
 
 export function resolveClickupStatusFromLabel(label, stageLabelMap = null) {
@@ -91,11 +152,25 @@ export function resolveClickupStatusFromLabel(label, stageLabelMap = null) {
 }
 
 export function listControlledStageLabels(tasksOrStatuses = [], stageLabelMap = null) {
+  const map = stageLabelMap instanceof Map ? stageLabelMap : buildStageLabelMap(stageLabelMap)
   const labels = new Map()
+
+  for (const label of map.values()) {
+    const normalizedLabel = normalizeLabelKey(label)
+    if (!normalizedLabel) continue
+    labels.set(normalizedLabel, label)
+  }
+
+  for (const label of [...Object.keys(LEGACY_CLICKUP_LABEL_STATUS_MAP), ...LEGACY_CONTROLLED_STAGE_LABELS]) {
+    const normalizedLabel = normalizeLabelKey(label)
+    if (!normalizedLabel) continue
+    labels.set(normalizedLabel, label)
+  }
 
   for (const item of tasksOrStatuses || []) {
     const status = typeof item === 'string' ? item : item?.status
-    const label = resolveBradialStageLabel(status, stageLabelMap)
+    const normalizedStatus = normalizeLabelKey(status)
+    const label = map.get(normalizedStatus)
     if (!label) continue
     labels.set(normalizeLabelKey(label), label)
   }

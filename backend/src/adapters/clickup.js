@@ -1,5 +1,10 @@
 import fs from 'node:fs'
 import { normalizePhone, normalizeText, phoneFieldLooksRelevant } from '../utils/normalizers.js'
+import {
+  mapChatPriorityToClickupPriorityValue,
+  resolveTaskEventConfirmation,
+  resolveTaskUrgency,
+} from '../services/clickupLeadContext.js'
 
 function normalizeScopeName(value) {
   return normalizeText(value).replace(/^\d+\s*[\.\-\)]\s*/, '')
@@ -23,6 +28,28 @@ function normalizeTaskStatusType(statusType) {
   return 0
 }
 
+function mapAssigneeActor(assignee) {
+  if (!assignee || typeof assignee !== 'object') return null
+
+  const email = String(assignee.email || '').trim() || null
+  const username = String(assignee.username || '').trim() || null
+  const displayName =
+    String(
+      assignee.name ||
+        assignee.full_name ||
+        assignee.initials ||
+        username ||
+        (email ? email.split('@')[0] : ''),
+    ).trim() || null
+
+  return {
+    id: assignee.id == null ? null : String(assignee.id),
+    username,
+    email,
+    name: displayName,
+  }
+}
+
 export function createClickupAdapter(config, pushLog) {
   const apiBaseUrl = String(config.apiBaseUrl || 'https://api.clickup.com/api/v2').replace(/\/$/, '')
   const explicitApiKey = String(config.apiKey || '').trim()
@@ -34,6 +61,7 @@ export function createClickupAdapter(config, pushLog) {
   const maxListPages = Math.max(1, Number(config.maxListPages || 4))
   const backupClientName = normalizeText(config.backupClientName || 'Stev')
   const backupPath = String(config.clientsBackupPath || '').trim()
+  const urgencyFieldNames = String(config.urgencyFieldNames || '').trim()
   let resolvedContext = null
   let resolvedNavigation = null
 
@@ -238,9 +266,28 @@ export function createClickupAdapter(config, pushLog) {
 
     const phoneField = customFields.find((field) => phoneFieldLooksRelevant(field.name))
     const emailField = customFields.find((field) => normalizeText(field.name) === 'e-mail')
-    const assignees = Array.isArray(task.assignees)
-      ? task.assignees.map((assignee) => String(assignee.username || assignee.email || '').trim()).filter(Boolean)
+    const assigneeActors = Array.isArray(task.assignees)
+      ? task.assignees.map((assignee) => mapAssigneeActor(assignee)).filter(Boolean)
       : []
+    const assignees = assigneeActors
+      .map((assignee) => assignee.email || assignee.username || assignee.name || '')
+      .filter(Boolean)
+    const primaryAssignee = assigneeActors[0] || null
+    const urgency = resolveTaskUrgency(
+      {
+        priority: task.priority || null,
+        custom_fields: customFields,
+      },
+      {
+        urgencyFieldNames,
+      },
+    )
+    const eventConfirmation = resolveTaskEventConfirmation(
+      {
+        custom_fields: customFields,
+      },
+      {},
+    )
 
     return {
       id: String(task.id),
@@ -249,8 +296,18 @@ export function createClickupAdapter(config, pushLog) {
       email: emailField?.value ? String(emailField.value).trim() : null,
       status: String(task.status?.status || 'sem status').trim(),
       statusType: String(task.status?.type || 'unknown').trim(),
-      owner: assignees[0] || null,
+      priority: urgency.chatPriority,
+      urgency: urgency.rawValue,
+      urgencySource: urgency.source,
+      urgencyFieldName: urgency.fieldName,
+      eventInviteConfirmed: eventConfirmation.checked,
+      eventInviteConfirmedFieldName: eventConfirmation.fieldName,
+      owner: primaryAssignee?.name || primaryAssignee?.username || primaryAssignee?.email || null,
+      ownerEmail: primaryAssignee?.email || null,
+      ownerId: primaryAssignee?.id || null,
+      ownerActor: primaryAssignee,
       assignees,
+      assigneeActors,
       listId: String(navigationList?.id || task.list?.id || task.list_id || ''),
       listName: String(navigationList?.name || task.list?.name || '').trim(),
       folderId: String(navigation?.folder?.id || task.folder?.id || task.folder_id || ''),
@@ -262,6 +319,7 @@ export function createClickupAdapter(config, pushLog) {
         : [],
       customFields,
       url: String(task.url || '').trim() || null,
+      dateClosed: task.date_closed || null,
       dateUpdated: task.date_updated || task.date_updated_local || null,
     }
   }
@@ -290,7 +348,17 @@ export function createClickupAdapter(config, pushLog) {
 
     const context = await resolveWorkspaceContext()
     const navigation = await resolveCommercialNavigation(context)
-    const task = await request(`/task/${normalizedTaskId}`, context.token)
+    
+    let task
+    try {
+      task = await request(`/task/${normalizedTaskId}`, context.token)
+    } catch (error) {
+      if (String(error.message).includes('404')) {
+        return null
+      }
+      throw error
+    }
+
     const navigationList =
       navigation.lists.find((list) => String(list.id) === String(task?.list?.id || task?.list_id || '')) || null
 
@@ -343,6 +411,43 @@ export function createClickupAdapter(config, pushLog) {
     return fetchTaskById(normalizedTaskId, trigger)
   }
 
+  async function updateTaskPriority(taskId, priority, trigger = 'manual-priority-update') {
+    const normalizedTaskId = String(taskId || '').trim()
+    if (!normalizedTaskId) {
+      throw new Error('Task do ClickUp obrigatoria para atualizar a prioridade.')
+    }
+
+    const context = await resolveWorkspaceContext()
+    await resolveCommercialNavigation(context)
+
+    const clickupPriority = mapChatPriorityToClickupPriorityValue(priority)
+
+    await request(
+      `/task/${normalizedTaskId}`,
+      context.token,
+      {},
+      {
+        method: 'PUT',
+        body: {
+          priority: clickupPriority,
+        },
+      },
+    )
+
+    pushLog(
+      'success',
+      'Prioridade ClickUp atualizada',
+      `Task ${normalizedTaskId} atualizada para prioridade ${clickupPriority ?? 'none'}.`,
+      {
+        trigger,
+        taskId: normalizedTaskId,
+        priority: clickupPriority,
+      },
+    )
+
+    return fetchTaskById(normalizedTaskId, trigger)
+  }
+
   async function fetchSnapshot(trigger = 'manual') {
     const snapshotAt = new Date().toISOString()
     const context = await resolveWorkspaceContext()
@@ -382,5 +487,6 @@ export function createClickupAdapter(config, pushLog) {
     fetchSnapshot,
     fetchTaskById,
     updateTaskStatus,
+    updateTaskPriority,
   }
 }

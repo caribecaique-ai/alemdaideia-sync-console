@@ -9,9 +9,11 @@ import {
   labelsIncludeEquivalent,
   normalizeLabelKey,
   pickControlledLabels,
-  resolveBradialStageLabel,
+  resolveBradialStageLabels,
   stripControlledStageLabels,
 } from '../services/clickupStageLabels.js'
+import { matchChatAgent } from '../services/agentMatching.js'
+import { isClosedOpportunityTask } from '../services/clickupLeadContext.js'
 
 function normalizeLabels(labels) {
   const unique = new Map()
@@ -46,6 +48,73 @@ function toConversationLabelValue(label) {
 
 function mergeLabels(currentLabels, nextLabels = []) {
   return normalizeLabels([...(currentLabels || []), ...nextLabels])
+}
+
+function normalizeConversationPriority(value) {
+  const normalized = normalizeText(value)
+  if (!normalized) return null
+
+  if (normalized === 'urgent' || normalized === 'urgente') return 'urgent'
+  if (normalized === 'high' || normalized === 'alta' || normalized === 'alto') return 'high'
+  if (normalized === 'medium' || normalized === 'media' || normalized === 'medio' || normalized === 'normal') return 'medium'
+  if (normalized === 'low' || normalized === 'baixa' || normalized === 'baixo') return 'low'
+
+  return null
+}
+
+function resolveStoredTaskActor(task = {}) {
+  const structuredCandidates = [
+    task?.ownerActor,
+    ...(Array.isArray(task?.assigneeActors) ? task.assigneeActors : []),
+    ...(Array.isArray(task?.assignees) ? task.assignees : []),
+    task?.owner,
+  ].filter(Boolean)
+
+  for (const candidate of structuredCandidates) {
+    if (candidate && typeof candidate === 'object') {
+      const email = String(candidate.email || '').trim() || null
+      const username = String(candidate.username || '').trim() || null
+      const name =
+        String(candidate.name || candidate.full_name || username || (email ? email.split('@')[0] : '')).trim() ||
+        null
+
+      if (email || username || name) {
+        return {
+          id: candidate.id == null ? null : String(candidate.id),
+          username: username || name || null,
+          email,
+          name: name || username || null,
+        }
+      }
+      continue
+    }
+
+    const primary = String(candidate || '').trim()
+    if (!primary) continue
+
+    const email = primary.includes('@') ? primary : null
+    const name = email ? email.split('@')[0] : primary
+
+    return {
+      id: null,
+      username: name || null,
+      email,
+      name: name || null,
+    }
+  }
+
+  return null
+}
+
+function shallowEqualObject(left = {}, right = {}) {
+  const leftKeys = Object.keys(left || {}).sort()
+  const rightKeys = Object.keys(right || {}).sort()
+  if (leftKeys.length !== rightKeys.length) return false
+
+  return leftKeys.every((key, index) => {
+    if (key !== rightKeys[index]) return false
+    return String(left[key] ?? '') === String(right[key] ?? '')
+  })
 }
 
 function isPhoneAlreadyInUseError(error) {
@@ -141,10 +210,13 @@ function conversationMatchesIdentity(conversation, { contactId, phone, name } = 
 function formatSyncStatus(labels) {
   if (labelsIncludeEquivalent(labels, 'perdido')) return 'resolved'
   if (labelsIncludeEquivalent(labels, 'negocio-fechado')) return 'resolved'
-  if (labelsIncludeEquivalent(labels, 'negócio-fechado')) return 'resolved'
-  if (labelsIncludeEquivalent(labels, 'em-negociação')) return 'pending'
-  if (labelsIncludeEquivalent(labels, 'qualificação')) return 'pending'
+  if (labelsIncludeEquivalent(labels, 'negocio fechado')) return 'resolved'
+  if (labelsIncludeEquivalent(labels, 'em-negociacao')) return 'pending'
+  if (labelsIncludeEquivalent(labels, 'em negociacao')) return 'pending'
+  if (labelsIncludeEquivalent(labels, 'qualificacao')) return 'pending'
+  if (labelsIncludeEquivalent(labels, 'em qualificacao')) return 'pending'
   if (labelsIncludeEquivalent(labels, 'reuniao-agendada')) return 'pending'
+  if (labelsIncludeEquivalent(labels, 'reuniao agendada')) return 'pending'
   if (labelsIncludeEquivalent(labels, 'confirmado')) return 'pending'
 
   return 'open'
@@ -209,6 +281,13 @@ export function createBradialAdapter(config, pushLog) {
   const contactSearchPages = Math.max(maxPages, Number(config.contactSearchPages || 20))
   const labelVerifyAttempts = Math.max(1, Number(config.labelVerifyAttempts || 2))
   const labelVerifyDelayMs = Math.max(25, Number(config.labelVerifyDelayMs || 75))
+  const syncConversationPriority = config.syncConversationPriority !== false
+  const syncConversationAssignment = config.syncConversationAssignment !== false
+  const syncClosedByAssignment = config.syncClosedByAssignment !== false
+  const syncClosedByAttributes = config.syncClosedByAttributes !== false
+  const autoCreateConversations = config.autoCreateConversations === true
+  const agentAliasMap = config.agentAliasMap || null
+  const closedStageLabels = config.closedStageLabels || ''
   let chatLabelCatalogCache = null
 
   if (!baseUrl || !apiToken) {
@@ -331,10 +410,9 @@ export function createBradialAdapter(config, pushLog) {
 
   function buildContactPayload(task, existingLead = null, options = {}) {
     const includeLabels = options.includeLabels !== false
-    const targetStageLabel =
-      String(
-        options.targetStageLabel || resolveBradialStageLabel(task?.status, configuredStageLabelMap) || '',
-      ).trim() || null
+    const targetStageLabels = Array.isArray(options.targetStageLabels)
+      ? normalizeLabels(options.targetStageLabels)
+      : resolveBradialStageLabels(task, configuredStageLabelMap)
     const controlledStageLabels = Array.isArray(options.controlledStageLabels)
       ? options.controlledStageLabels
       : []
@@ -342,7 +420,10 @@ export function createBradialAdapter(config, pushLog) {
       existingLead?.bradialLabels || existingLead?.raw?.bradialLabels || [],
       controlledStageLabels,
     )
-    const labels = mergeLabels(preservedLabels, [targetStageLabel || opportunityLabel].filter(Boolean))
+    const labels = mergeLabels(
+      preservedLabels,
+      (targetStageLabels.length ? targetStageLabels : [opportunityLabel]).filter(Boolean),
+    )
 
     const payload = {
       name: String(task?.name || existingLead?.name || '').trim() || undefined,
@@ -431,6 +512,48 @@ export function createBradialAdapter(config, pushLog) {
         fallbackContact?.chatContactId ||
         null,
     )
+  }
+
+  function buildLinkedLeadStub(
+    existingLead,
+    payload,
+    {
+      preferredContactId = null,
+      preferredChatContactId = null,
+      preferredConversationId = null,
+    } = {},
+  ) {
+    const partnerContactId =
+      normalizeContactRecordId(preferredContactId || resolvePartnerContactId(existingLead, null)) || null
+    const conversationId =
+      String(
+        preferredConversationId || existingLead?.conversationId || existingLead?.chatConversationId || '',
+      ).trim() || null
+    const chatContactId =
+      String(preferredChatContactId || existingLead?.chatContactId || partnerContactId || '').trim() || null
+    const labels = normalizeLabels(existingLead?.bradialLabels || existingLead?.raw?.bradialLabels || [])
+
+    return {
+      ...(existingLead || {}),
+      id:
+        existingLead?.id ||
+        (partnerContactId ? `lead-${partnerContactId}` : conversationId ? `lead-conversation-${conversationId}` : null),
+      conversationId: conversationId || existingLead?.conversationId || null,
+      chatConversationId: conversationId || existingLead?.chatConversationId || null,
+      chatContactId: chatContactId || existingLead?.chatContactId || null,
+      name: payload?.name || existingLead?.name || null,
+      phone: payload?.phoneNumber || existingLead?.phone || null,
+      email:
+        payload?.email || existingLead?.email || existingLead?.raw?.bradialEmail || null,
+      bradialLabels: labels,
+      raw: {
+        ...(existingLead?.raw || {}),
+        bradialContactId: partnerContactId || existingLead?.raw?.bradialContactId || null,
+        bradialLabels: labels,
+        bradialEmail:
+          payload?.email || existingLead?.raw?.bradialEmail || existingLead?.email || null,
+      },
+    }
   }
 
   async function clearPartnerContactLabels(contactId) {
@@ -575,6 +698,11 @@ export function createBradialAdapter(config, pushLog) {
     return extractChatwootList(data)
   }
 
+  async function listContactableInboxes(contactId) {
+    const data = await requestChat(`/api/v1/accounts/${chatAccountId}/contacts/${contactId}/contactable_inboxes`)
+    return extractChatwootList(data)
+  }
+
   async function updateChatContact(contactId, payload) {
     await requestChat(`/api/v1/accounts/${chatAccountId}/contacts/${contactId}`, {
       method: 'PUT',
@@ -607,6 +735,53 @@ export function createBradialAdapter(config, pushLog) {
     return extractChatwootList(data)
   }
 
+  async function listAssignableChatAgents() {
+    if (!chatEnabled) return []
+
+    if (chatInboxId) {
+      const data = await requestChat(`/api/v1/accounts/${chatAccountId}/inbox_members/${chatInboxId}`)
+      return extractChatwootList(data)
+    }
+
+    const data = await requestChat(`/api/v1/accounts/${chatAccountId}/agents`)
+    return extractChatwootList(data)
+  }
+
+  async function fetchConversation(conversationId) {
+    const data = await requestChat(`/api/v1/accounts/${chatAccountId}/conversations/${conversationId}`)
+    return extractChatwootObject(data)
+  }
+
+  async function listChatAccountLabels() {
+    if (!chatEnabled) return []
+
+    try {
+      const data = await requestChat(`/api/v2/accounts/${chatAccountId}/reports/inbox_label_matrix`)
+      const labels = Array.isArray(data?.labels) ? data.labels : []
+      const titles = labels
+        .map((item) => String(item?.title || item?.name || item || '').trim())
+        .filter(Boolean)
+
+      if (titles.length) {
+        return normalizeLabels(titles)
+      }
+    } catch {
+      // Fallback below.
+    }
+
+    const snapshot = await fetchSnapshot('chat-label-catalog-fallback')
+    const observed = new Set()
+
+    for (const lead of snapshot.leads || []) {
+      for (const label of lead.labels || []) {
+        const normalized = String(label || '').trim()
+        if (normalized) observed.add(normalized)
+      }
+    }
+
+    return normalizeLabels([...observed])
+  }
+
   async function updateConversationLabels(conversationId, labels) {
     const data = await requestChat(`/api/v1/accounts/${chatAccountId}/conversations/${conversationId}/labels`, {
       method: 'POST',
@@ -621,6 +796,134 @@ export function createBradialAdapter(config, pushLog) {
       body: { labels },
     })
     return normalizeLabels(extractChatwootList(data))
+  }
+
+  async function updateConversationPriority(conversationId, priority) {
+    return requestChat(`/api/v1/accounts/${chatAccountId}/conversations/${conversationId}/toggle_priority`, {
+      method: 'POST',
+      body: { priority: priority || 'none' },
+    })
+  }
+
+  async function updateConversationCustomAttributes(conversationId, customAttributes) {
+    return requestChat(
+      `/api/v1/accounts/${chatAccountId}/conversations/${conversationId}/custom_attributes`,
+      {
+        method: 'POST',
+        body: { custom_attributes: customAttributes },
+      },
+    )
+  }
+
+  async function assignConversation(conversationId, assigneeId) {
+    return requestChat(`/api/v1/accounts/${chatAccountId}/conversations/${conversationId}/assignments`, {
+      method: 'POST',
+      body: {
+        assignee_id: assigneeId == null ? null : Number(assigneeId),
+      },
+    })
+  }
+
+  function extractContactInboxBindings(source) {
+    const bindings = Array.isArray(source?.contact_inboxes)
+      ? source.contact_inboxes
+      : Array.isArray(source?.contactInboxes)
+        ? source.contactInboxes
+        : []
+
+    return bindings
+      .map((binding) => {
+        const inboxId =
+          String(binding?.inbox?.id || binding?.inbox_id || binding?.inboxId || '').trim() || null
+        const sourceId = String(binding?.source_id || binding?.sourceId || '').trim() || null
+        return {
+          inboxId,
+          sourceId,
+          raw: binding,
+        }
+      })
+      .filter((binding) => binding.inboxId && binding.sourceId)
+  }
+
+  function pickConversationBinding(bindings = [], preferredInboxId = chatInboxId) {
+    const normalizedPreferredInboxId = String(preferredInboxId || '').trim()
+    const normalizedBindings = (bindings || []).filter((binding) => binding?.inboxId && binding?.sourceId)
+    if (!normalizedBindings.length) return null
+
+    return (
+      normalizedBindings.find((binding) => binding.inboxId === normalizedPreferredInboxId) ||
+      normalizedBindings[0]
+    )
+  }
+
+  async function resolveConversationCreationBinding(contactId, chatContact, preferredInboxId = chatInboxId) {
+    const directBinding = pickConversationBinding(
+      extractContactInboxBindings(chatContact),
+      preferredInboxId,
+    )
+    if (directBinding) return directBinding
+
+    const normalizedContactId = String(contactId || '').trim()
+    if (!normalizedContactId) return null
+
+    const contactableBindings = pickConversationBinding(
+      extractContactInboxBindings({
+        contact_inboxes: await listContactableInboxes(normalizedContactId).catch(() => []),
+      }),
+      preferredInboxId,
+    )
+
+    return contactableBindings || null
+  }
+
+  async function createConversation({
+    contactId,
+    sourceId,
+    inboxId = chatInboxId,
+    assigneeId = null,
+    customAttributes = null,
+    additionalAttributes = null,
+    status = 'open',
+  }) {
+    const normalizedContactId = Number(contactId)
+    const normalizedInboxId = Number(inboxId)
+    const normalizedSourceId = String(sourceId || '').trim()
+
+    if (!Number.isFinite(normalizedContactId) || normalizedContactId <= 0) {
+      throw new Error('Nao foi possivel criar a conversa: contact_id invalido.')
+    }
+    if (!Number.isFinite(normalizedInboxId) || normalizedInboxId <= 0) {
+      throw new Error('Nao foi possivel criar a conversa: inbox_id invalido.')
+    }
+    if (!normalizedSourceId) {
+      throw new Error('Nao foi possivel criar a conversa: source_id ausente.')
+    }
+
+    const body = {
+      source_id: normalizedSourceId,
+      inbox_id: normalizedInboxId,
+      contact_id: normalizedContactId,
+      status: status || 'open',
+    }
+
+    if (assigneeId != null && assigneeId !== '') {
+      body.assignee_id = Number(assigneeId)
+    }
+    if (customAttributes && typeof customAttributes === 'object' && Object.keys(customAttributes).length) {
+      body.custom_attributes = customAttributes
+    }
+    if (
+      additionalAttributes &&
+      typeof additionalAttributes === 'object' &&
+      Object.keys(additionalAttributes).length
+    ) {
+      body.additional_attributes = additionalAttributes
+    }
+
+    return requestChat(`/api/v1/accounts/${chatAccountId}/conversations`, {
+      method: 'POST',
+      body,
+    })
   }
 
   async function mergeChatContacts(baseContactId, mergeeContactId) {
@@ -739,6 +1042,7 @@ export function createBradialAdapter(config, pushLog) {
     phone,
     name,
     targetStageLabel,
+    targetStageLabels = [],
     controlledStageLabels,
     dryRun,
     preferredChatContactId = null,
@@ -752,10 +1056,27 @@ export function createBradialAdapter(config, pushLog) {
       }
     }
 
-    const chatContact = await resolveChatContact(contactId, phone, preferredChatContactId)
+    const preferredConversation = preferredConversationId
+      ? await fetchConversation(preferredConversationId)
+          .catch(async () => ({
+            id: preferredConversationId,
+            labels: await listConversationLabels(preferredConversationId).catch(() => []),
+            meta: {
+              sender: {
+                id: preferredChatContactId || contactId || null,
+              },
+            },
+          }))
+      : null
+    const shouldResolveChatContact = !preferredConversation || syncContactLabels
+    const chatContact = shouldResolveChatContact
+      ? await resolveChatContact(contactId, phone, preferredChatContactId)
+      : null
     const fallbackConversation = chatContact?.id
       ? null
-      : await findConversationByIdentity({
+      : preferredConversation
+        ? null
+        : await findConversationByIdentity({
           contactId: chatContact?.id || preferredChatContactId || contactId,
           phone,
           name,
@@ -769,67 +1090,74 @@ export function createBradialAdapter(config, pushLog) {
       }
     }
 
-    const conversations = chatContact?.id ? await listContactConversations(chatContact.id) : []
-    const preferredConversation = preferredConversationId
-      ? {
-          id: preferredConversationId,
-          labels: await listConversationLabels(preferredConversationId).catch(() => []),
-          meta: {
-            sender: {
-              id: chatContact?.id || preferredChatContactId || contactId,
-            },
-          },
-        }
-      : null
+    const conversations = preferredConversation || !chatContact?.id
+      ? []
+      : await listContactConversations(chatContact.id)
     const discoveredConversation =
-      fallbackConversation ||
-      pickBestConversation(conversations, chatInboxId) ||
-      (await findConversationByIdentity({
-        contactId: chatContact?.id || preferredChatContactId || contactId,
-        phone,
-        name,
-      }))
-    const knownConversations = dedupeConversations(
+      preferredConversation
+        ? null
+        : fallbackConversation ||
+          pickBestConversation(conversations, chatInboxId) ||
+          (await findConversationByIdentity({
+            contactId: chatContact?.id || preferredChatContactId || contactId,
+            phone,
+            name,
+          }))
+    let knownConversations = dedupeConversations(
       [preferredConversation, discoveredConversation, ...(conversations || [])].filter(Boolean),
     )
-    const conversation = preferredConversation || discoveredConversation || knownConversations[0] || null
-    const effectiveChatContactId = String(
-      chatContact?.id || conversation?.meta?.sender?.id || preferredChatContactId || contactId,
-    )
+    let conversation = preferredConversation || discoveredConversation || knownConversations[0] || null
+    const effectiveChatContactId =
+      String(
+        chatContact?.id ||
+          preferredConversation?.meta?.sender?.id ||
+          conversation?.meta?.sender?.id ||
+          preferredChatContactId ||
+          contactId ||
+          '',
+      ).trim() || null
     const resolvedControlledChatStageLabels = await Promise.all(
       (controlledStageLabels || []).map((label) => resolveAccountLabelTitle(label)),
     )
     const controlledChatStageLabels = resolvedControlledChatStageLabels.map((label) =>
       toConversationLabelValue(label),
     )
-    const targetAccountLabel = await resolveAccountLabelTitle(targetStageLabel || opportunityLabel)
-    const targetConversationLabel = toConversationLabelValue(targetAccountLabel)
-    const currentChatContactLabels = syncContactLabels && effectiveChatContactId
+    const effectiveTargetStageLabels = normalizeLabels(
+      (targetStageLabels || []).length ? targetStageLabels : [targetStageLabel || opportunityLabel],
+    )
+    const targetAccountLabels = await Promise.all(
+      effectiveTargetStageLabels.map((label) => resolveAccountLabelTitle(label)),
+    )
+    const targetConversationLabels = normalizeLabels(
+      targetAccountLabels.map((label) => toConversationLabelValue(label)),
+    )
+    const currentChatContactLabels = effectiveChatContactId
       ? await listChatContactLabels(effectiveChatContactId).catch(() => [])
       : []
+    const strippedChatContactLabels = stripControlledStageLabels(
+      currentChatContactLabels,
+      controlledChatStageLabels,
+    )
     const nextChatContactLabels = syncContactLabels
-      ? mergeLabels(
-          stripControlledStageLabels(currentChatContactLabels, controlledChatStageLabels),
-          [targetConversationLabel].filter(Boolean),
-        )
-      : []
+      ? mergeLabels(strippedChatContactLabels, targetConversationLabels.filter(Boolean))
+      : strippedChatContactLabels
 
     let contactLabelOperation = syncContactLabels ? 'noop' : 'disabled'
     let syncedChatContactLabels = currentChatContactLabels
+    let createdConversationId = null
 
-    const contactLabelsChanged = syncContactLabels
-      ? !labelsEqual(currentChatContactLabels, nextChatContactLabels)
-      : false
+    const contactLabelsChanged =
+      Boolean(effectiveChatContactId) && !labelsEqual(currentChatContactLabels, nextChatContactLabels)
 
     if (contactLabelsChanged) {
-      contactLabelOperation = 'update'
+      contactLabelOperation = syncContactLabels ? 'update' : 'clear'
       syncedChatContactLabels = dryRun
         ? nextChatContactLabels
         : currentChatContactLabels
     }
 
     const applyChatContactLabelState = async () => {
-      if (!syncContactLabels || !contactLabelsChanged || dryRun || !effectiveChatContactId) {
+      if (!contactLabelsChanged || dryRun || !effectiveChatContactId) {
         return syncedChatContactLabels
       }
 
@@ -864,13 +1192,73 @@ export function createBradialAdapter(config, pushLog) {
       }
     }
 
+    if (!conversation?.id && autoCreateConversations && effectiveChatContactId && chatInboxId) {
+      const creationBinding = await resolveConversationCreationBinding(
+        effectiveChatContactId,
+        chatContact,
+        chatInboxId,
+      )
+
+      if (creationBinding?.sourceId) {
+        if (dryRun) {
+          return {
+            enabled: true,
+            skipped: false,
+            operation: 'create',
+            dryRun: true,
+            reason: 'conversation_will_be_created',
+            conversationId: null,
+            knownConversationId: preferredConversationId ? String(preferredConversationId) : null,
+            chatContactId: effectiveChatContactId,
+            labels: targetConversationLabels.filter(Boolean),
+            contactLabels: nextChatContactLabels,
+            contactLabelOperation,
+            conversationLabelOperation: 'update',
+          }
+        }
+
+        const createdConversation = await createConversation({
+          contactId: effectiveChatContactId,
+          sourceId: creationBinding.sourceId,
+          inboxId: creationBinding.inboxId,
+          status: 'open',
+        })
+        const hydratedConversation =
+          (createdConversation?.id
+            ? await fetchConversation(createdConversation.id).catch(() => createdConversation)
+            : null) || createdConversation
+
+        if (hydratedConversation?.id) {
+          createdConversationId = String(hydratedConversation.id)
+          conversation = hydratedConversation
+          knownConversations = dedupeConversations([...knownConversations, hydratedConversation])
+          pushLog(
+            'info',
+            'Conversa iniciada automaticamente no Bradial',
+            `${name || phone || `Contato ${effectiveChatContactId}`} recebeu uma conversa vazia para sincronizar etapa e responsavel.`,
+            {
+              chatContactId: effectiveChatContactId,
+              conversationId: createdConversationId,
+              inboxId: creationBinding.inboxId,
+              stageLabels: effectiveTargetStageLabels,
+            },
+          )
+        }
+      }
+    }
+
     if (!conversation?.id) {
       syncedChatContactLabels = await applyChatContactLabelState()
+      const contactOnlyHandled =
+        syncContactLabels &&
+        Boolean(effectiveChatContactId) &&
+        labelsEqual(syncedChatContactLabels, nextChatContactLabels)
       return {
         enabled: true,
-        skipped: true,
-        reason: 'conversation_not_found',
-        operation: 'noop',
+        skipped: !contactOnlyHandled,
+        reason: contactOnlyHandled ? 'contact_labels_synced_without_conversation' : 'conversation_required_for_stage_label',
+        operation:
+          contactLabelOperation === 'update' || contactLabelOperation === 'clear' ? 'update' : 'noop',
         conversationId: null,
         knownConversationId: preferredConversationId ? String(preferredConversationId) : null,
         chatContactId: effectiveChatContactId,
@@ -888,7 +1276,7 @@ export function createBradialAdapter(config, pushLog) {
           : await listConversationLabels(item.id)
         const nextLabels = mergeLabels(
           stripControlledStageLabels(currentLabels, controlledChatStageLabels),
-          [targetConversationLabel].filter(Boolean),
+          targetConversationLabels.filter(Boolean),
         )
 
         return {
@@ -908,7 +1296,7 @@ export function createBradialAdapter(config, pushLog) {
       return {
         enabled: true,
         skipped: false,
-        operation: 'noop',
+        operation: createdConversationId ? 'create' : 'noop',
         conversationId: String(primaryPlan.id),
         knownConversationId: preferredConversationId ? String(preferredConversationId) : null,
         chatContactId: effectiveChatContactId,
@@ -967,11 +1355,13 @@ export function createBradialAdapter(config, pushLog) {
       enabled: true,
       skipped: false,
       operation:
-        contactLabelOperation === 'update' ||
-        contactLabelOperation === 'clear' ||
-        conversationLabelsChanged
-          ? 'update'
-          : 'noop',
+        createdConversationId
+          ? 'create'
+          : contactLabelOperation === 'update' ||
+              contactLabelOperation === 'clear' ||
+              conversationLabelsChanged
+            ? 'update'
+            : 'noop',
       conversationId: String(primaryPlan.id),
       knownConversationId: preferredConversationId ? String(preferredConversationId) : null,
       chatContactId: effectiveChatContactId,
@@ -979,6 +1369,191 @@ export function createBradialAdapter(config, pushLog) {
       contactLabels: verifiedChatContactLabels,
       contactLabelOperation,
       conversationLabelOperation: conversationLabelsChanged ? 'update' : 'noop',
+    }
+  }
+
+  async function syncConversationMetadata({
+    conversationId,
+    task,
+    clickupContext = null,
+    chatAgents = [],
+    dryRun = false,
+  }) {
+    if (!chatEnabled) {
+      return {
+        enabled: false,
+        skipped: true,
+        reason: 'chat_api_not_configured',
+      }
+    }
+
+    const normalizedConversationId = String(conversationId || '').trim()
+    if (!normalizedConversationId) {
+      return {
+        enabled: true,
+        skipped: true,
+        reason: 'conversation_not_found',
+      }
+    }
+
+    const currentConversation = await fetchConversation(normalizedConversationId)
+    const currentPriority = normalizeConversationPriority(currentConversation?.priority)
+    const currentAssigneeId =
+      String(currentConversation?.meta?.assignee?.id || currentConversation?.assignee_id || '').trim() || null
+    const currentCustomAttributes =
+      currentConversation?.custom_attributes && typeof currentConversation.custom_attributes === 'object'
+        ? currentConversation.custom_attributes
+        : {}
+
+    const targetPriority = syncConversationPriority
+      ? normalizeConversationPriority(task?.priority)
+      : null
+    const closedTask = isClosedOpportunityTask(task, {
+      stageLabelMap: configuredStageLabelMap,
+      closedStageLabels,
+    })
+    const responsibleActor = resolveStoredTaskActor(task)
+    const closerActor = closedTask
+      ? (clickupContext?.isStatusEvent ? clickupContext.actor : null) || resolveStoredTaskActor(task)
+      : null
+    const assignmentActor = responsibleActor || (syncClosedByAssignment ? closerActor : null)
+    const assignableAgents =
+      Array.isArray(chatAgents) && chatAgents.length ? chatAgents : await listAssignableChatAgents().catch(() => [])
+    const agentMatch = assignmentActor
+      ? matchChatAgent(assignableAgents, assignmentActor, agentAliasMap)
+      : null
+    const targetAssigneeId =
+      syncConversationAssignment && assignmentActor && agentMatch?.matched && agentMatch?.agent?.id != null
+        ? String(agentMatch.agent.id)
+        : null
+
+    const nextCustomAttributes = { ...currentCustomAttributes }
+
+    if (task?.urgency) {
+      nextCustomAttributes.clickup_urgency = task.urgency
+    } else {
+      delete nextCustomAttributes.clickup_urgency
+    }
+    delete nextCustomAttributes.clickup_urgency_source
+
+    if (syncClosedByAttributes && closerActor) {
+      nextCustomAttributes.clickup_closed_by_name = closerActor.name || closerActor.username || ''
+      nextCustomAttributes.clickup_closed_by_email = closerActor.email || ''
+      nextCustomAttributes.clickup_closed_by_id = closerActor.id || ''
+      nextCustomAttributes.clickup_closed_via_status = String(task?.status || '').trim()
+    } else if (!closedTask) {
+      delete nextCustomAttributes.clickup_closed_by_name
+      delete nextCustomAttributes.clickup_closed_by_email
+      delete nextCustomAttributes.clickup_closed_by_id
+      delete nextCustomAttributes.clickup_closed_via_status
+    }
+
+    const priorityChanged = syncConversationPriority && currentPriority !== targetPriority
+    const customAttributesChanged = !shallowEqualObject(currentCustomAttributes, nextCustomAttributes)
+    const assignmentUnmatched =
+      syncConversationAssignment && Boolean(assignmentActor) && !agentMatch?.matched
+    const assignmentChanged =
+      syncConversationAssignment &&
+      !assignmentUnmatched &&
+      (Boolean(assignmentActor) || Boolean(currentAssigneeId)) &&
+      currentAssigneeId !== targetAssigneeId
+    const assignmentOperation = assignmentUnmatched
+      ? 'unmatched'
+      : assignmentChanged
+        ? targetAssigneeId
+          ? 'update'
+          : 'clear'
+        : 'noop'
+
+    if (!priorityChanged && !customAttributesChanged && !assignmentChanged) {
+      return {
+        enabled: true,
+        skipped: false,
+        operation: 'noop',
+        conversationId: normalizedConversationId,
+        priority: targetPriority,
+        assigneeId: currentAssigneeId,
+        matchedAgent: agentMatch?.matched ? agentMatch.agent : null,
+        matchReason: agentMatch?.reason || null,
+        assignmentOperation,
+      }
+    }
+
+    if (dryRun) {
+      return {
+        enabled: true,
+        skipped: false,
+        operation: 'update',
+        dryRun: true,
+        conversationId: normalizedConversationId,
+        priority: targetPriority,
+        assigneeId: assignmentChanged ? targetAssigneeId : currentAssigneeId,
+        matchedAgent: agentMatch?.matched ? agentMatch.agent : null,
+        matchReason: agentMatch?.reason || null,
+        priorityOperation: priorityChanged ? 'update' : 'noop',
+        customAttributesOperation: customAttributesChanged ? 'update' : 'noop',
+        assignmentOperation,
+      }
+    }
+
+    if (priorityChanged) {
+      await updateConversationPriority(normalizedConversationId, targetPriority)
+    }
+
+    if (customAttributesChanged) {
+      await updateConversationCustomAttributes(normalizedConversationId, nextCustomAttributes)
+    }
+
+    if (assignmentChanged) {
+      await assignConversation(normalizedConversationId, targetAssigneeId)
+    }
+
+    const verifiedConversation = await fetchConversation(normalizedConversationId)
+
+    return {
+      enabled: true,
+      skipped: false,
+      operation: 'update',
+      conversationId: normalizedConversationId,
+      priority: normalizeConversationPriority(verifiedConversation?.priority),
+      assigneeId:
+        String(verifiedConversation?.meta?.assignee?.id || verifiedConversation?.assignee_id || '').trim() || null,
+      matchedAgent: agentMatch?.matched ? agentMatch.agent : null,
+      matchReason: agentMatch?.reason || null,
+      priorityOperation: priorityChanged ? 'update' : 'noop',
+      customAttributesOperation: customAttributesChanged ? 'update' : 'noop',
+      assignmentOperation,
+      customAttributes:
+        verifiedConversation?.custom_attributes && typeof verifiedConversation.custom_attributes === 'object'
+          ? verifiedConversation.custom_attributes
+          : {},
+    }
+  }
+
+  async function syncLinkedConversationMetadata(task, options = {}) {
+    const normalizedConversationId = String(options.conversationId || '').trim()
+    if (!normalizedConversationId) {
+      return {
+        enabled: true,
+        skipped: true,
+        reason: 'conversation_not_found',
+        conversationId: null,
+        chatContactId: String(options.chatContactId || '').trim() || null,
+      }
+    }
+
+    const metadataSync = await syncConversationMetadata({
+      conversationId: normalizedConversationId,
+      task,
+      clickupContext: options.clickupContext || null,
+      chatAgents: options.chatAgents || [],
+      dryRun: Boolean(options.dryRun),
+    })
+
+    return {
+      ...metadataSync,
+      conversationId: normalizedConversationId,
+      chatContactId: String(options.chatContactId || '').trim() || null,
     }
   }
 
@@ -1079,21 +1654,25 @@ export function createBradialAdapter(config, pushLog) {
 
   async function upsertOpportunityContact(task, existingLead = null, options = {}) {
     const dryRun = Boolean(options.dryRun)
-    const targetStageLabel =
-      String(
-        options.targetStageLabel || resolveBradialStageLabel(task?.status, configuredStageLabelMap) || '',
-      ).trim() || null
+    const allowCreate = options.allowCreate !== false
+    const targetStageLabels = Array.isArray(options.targetStageLabels)
+      ? normalizeLabels(options.targetStageLabels)
+      : resolveBradialStageLabels(task, configuredStageLabelMap)
+    const targetStageLabel = targetStageLabels[0] || null
     const payload = buildContactPayload(task, existingLead, {
-      includeLabels: false,
-      targetStageLabel,
+      includeLabels: syncContactLabels,
+      targetStageLabels,
       controlledStageLabels: options.controlledStageLabels,
     })
     const createPayload = buildContactPayload(task, existingLead, {
       includeLabels: syncContactLabels,
-      targetStageLabel,
+      targetStageLabels,
       controlledStageLabels: options.controlledStageLabels,
     })
     if (syncContactLabels) {
+      payload.labels = await Promise.all(
+        (payload.labels || []).map((label) => resolveAccountLabelTitle(label)),
+      )
       createPayload.labels = await Promise.all(
         (createPayload.labels || []).map((label) => resolveAccountLabelTitle(label)),
       )
@@ -1116,8 +1695,26 @@ export function createBradialAdapter(config, pushLog) {
           existingLead?.chatContactId ||
           '',
       ).trim() || null
+    const preferredChatContactId =
+      String(options.preferredChatContactId || existingLead?.chatContactId || '').trim() || null
+    const preferredConversationId =
+      String(
+        options.preferredConversationId ||
+          existingLead?.conversationId ||
+          existingLead?.chatConversationId ||
+          '',
+      ).trim() || null
+    const linkedSyncTarget = Boolean(preferredConversationId || preferredChatContactId)
 
-    if (!resolvedContact?.chatContactId && preferredContactId) {
+    if (linkedSyncTarget) {
+      resolvedContact = buildLinkedLeadStub(existingLead, payload, {
+        preferredContactId,
+        preferredChatContactId,
+        preferredConversationId,
+      })
+    }
+
+    if (!linkedSyncTarget && !resolvedContact?.chatContactId && preferredContactId) {
       const hydratedById = await hydrateContactFromId(preferredContactId, payload.phoneNumber)
       if (hydratedById?.id) {
         resolvedContact = {
@@ -1137,7 +1734,7 @@ export function createBradialAdapter(config, pushLog) {
       }
     }
 
-    if (!resolvedContact?.chatContactId && payload.phoneNumber) {
+    if (!linkedSyncTarget && !resolvedContact?.chatContactId && payload.phoneNumber) {
       const hydratedExisting = await hydrateContactFromPhone(
         payload.phoneNumber,
         preferredContactId,
@@ -1166,24 +1763,37 @@ export function createBradialAdapter(config, pushLog) {
       }
     }
 
-    if (resolvedContact && isSamePayload(resolvedContact, payload)) {
+    const directContactId = normalizeContactRecordId(
+      preferredContactId || resolvePartnerContactId(resolvedContact, existingLead),
+    )
+    const skipContactLookup = linkedSyncTarget && !directContactId
+
+    if (skipContactLookup) {
+      contactOperation = 'noop'
+    } else if (resolvedContact && isSamePayload(resolvedContact, payload)) {
       contactOperation = 'noop'
     } else if (dryRun) {
-      contactOperation = resolvedContact?.chatContactId ? 'update' : 'create'
-    } else if (resolvedContact?.chatContactId) {
-      const targetContactId = resolvedContact.chatContactId
+      contactOperation = directContactId || resolvedContact?.chatContactId ? 'update' : 'create'
+    } else if (directContactId || resolvedContact?.chatContactId) {
+      const targetContactId = String(directContactId || resolvedContact?.chatContactId || '').trim()
       await request(`/v2/public-api/v1/contacts/${targetContactId}`, {
         method: 'PATCH',
         body: payload,
       })
 
       resolvedContact =
-        (await fetchContact(targetContactId).catch(() => null)) ||
-        (await hydrateContactFromPhone(payload.phoneNumber, targetContactId))
+        (await fetchContactSafely(targetContactId)) ||
+        buildLinkedLeadStub(resolvedContact, payload, {
+          preferredContactId: targetContactId,
+          preferredChatContactId,
+          preferredConversationId,
+        })
       if (!resolvedContact) {
         throw new Error(`Contato Bradial ${targetContactId} nao foi reidratado apos update.`)
       }
       contactOperation = 'update'
+    } else if (!allowCreate) {
+      contactOperation = 'create_disabled'
     } else {
       try {
         const created = await request('/v2/public-api/v1/contacts', {
@@ -1237,9 +1847,14 @@ export function createBradialAdapter(config, pushLog) {
       }
     }
 
-    const resolvedPartnerContactId = resolvePartnerContactId(resolvedContact, existingLead)
+    const resolvedPartnerContactId =
+      normalizeContactRecordId(directContactId || resolvePartnerContactId(resolvedContact, existingLead)) || null
 
-    if (!dryRun && resolvedPartnerContactId && contactOperation !== 'noop') {
+    if (
+      !dryRun &&
+      resolvedPartnerContactId &&
+      !['noop', 'create_disabled'].includes(contactOperation)
+    ) {
       const verifiedContact = await fetchContact(resolvedPartnerContactId)
       const verifiedLabels = normalizeLabels(verifiedContact?.labels)
       if (
@@ -1255,7 +1870,7 @@ export function createBradialAdapter(config, pushLog) {
     }
 
     let consolidatedChatContact = null
-    if (!dryRun && resolvedPartnerContactId) {
+    if (!dryRun && resolvedPartnerContactId && !linkedSyncTarget) {
       consolidatedChatContact = await ensureSingleChatContact({
         baseContactId: resolvedPartnerContactId,
         phone: payload.phoneNumber,
@@ -1282,16 +1897,18 @@ export function createBradialAdapter(config, pushLog) {
         contactId:
           resolvedPartnerContactId ||
           resolvedContact?.chatContactId ||
+          preferredChatContactId ||
           existingLead?.chatContactId ||
           null,
         phone: payload.phoneNumber,
         name: payload.name || task?.name || existingLead?.name || null,
         targetStageLabel: targetStageLabel || opportunityLabel,
+        targetStageLabels,
         controlledStageLabels: options.controlledStageLabels || [],
         dryRun,
         preferredChatContactId:
-          consolidatedChatContact?.contactId || options.preferredChatContactId || null,
-        preferredConversationId: options.preferredConversationId || null,
+          consolidatedChatContact?.contactId || preferredChatContactId || null,
+        preferredConversationId: preferredConversationId || null,
       })
     } catch (error) {
       conversationSync = {
@@ -1316,28 +1933,78 @@ export function createBradialAdapter(config, pushLog) {
       )
     }
 
+    let metadataSync = {
+      enabled: chatEnabled,
+      skipped: true,
+      reason: 'conversation_not_found',
+    }
+
+    try {
+      metadataSync = await syncConversationMetadata({
+        conversationId: conversationSync?.conversationId || preferredConversationId || null,
+        task,
+        clickupContext: options.clickupContext || null,
+        chatAgents: options.chatAgents || [],
+        dryRun,
+      })
+    } catch (error) {
+      metadataSync = {
+        enabled: chatEnabled,
+        skipped: true,
+        reason: 'conversation_metadata_sync_failed',
+        error: error.message,
+      }
+      pushLog(
+        'warning',
+        'Falha no sync de contexto da conversa',
+        error.message,
+        {
+          taskName: task?.name || null,
+          phone: payload.phoneNumber,
+          conversationId: conversationSync?.conversationId || preferredConversationId || null,
+        },
+      )
+    }
+
     return {
       operation:
-        contactOperation === 'noop' && conversationSync.operation === 'update' ? 'update' : contactOperation,
+        contactOperation === 'noop' &&
+        (
+          conversationSync.operation === 'create' ||
+          conversationSync.operation === 'update' ||
+          metadataSync.operation === 'update'
+        )
+          ? 'update'
+          : contactOperation,
       contactOperation,
       dryRun,
       payload,
       contact: resolvedContact,
       consolidatedChatContact: consolidatedChatContact || null,
       stageLabel: targetStageLabel || opportunityLabel,
+      stageLabels: targetStageLabels,
       previousStageLabels,
       conversationSync,
+      metadataSync,
     }
   }
 
   async function fetchSnapshot(trigger = 'manual') {
     const snapshotAt = new Date().toISOString()
-    const [contacts, agents, inboxes] = await Promise.all([
+    const normalizedTrigger = String(trigger || '').trim().toLowerCase()
+    const shouldHydrateListedContacts =
+      normalizedTrigger.includes('startup') ||
+      normalizedTrigger.includes('bootstrap') ||
+      (normalizedTrigger.includes('manual') &&
+        !normalizedTrigger.includes('reconcile') &&
+        !normalizedTrigger.includes('deferred'))
+    const [contacts, agents, inboxes, chatAgents] = await Promise.all([
       listPaged('/v2/public-api/v1/contacts'),
       listPaged('/v2/public-api/v1/agents'),
       listPaged('/v2/public-api/v1/inboxes'),
+      listAssignableChatAgents().catch(() => []),
     ])
-    const hydratedContacts = await hydrateContacts(contacts)
+    const hydratedContacts = shouldHydrateListedContacts ? await hydrateContacts(contacts) : contacts
 
     const leads = hydratedContacts.map((contact) => toLead(contact, snapshotAt))
     pushLog(
@@ -1355,6 +2022,7 @@ export function createBradialAdapter(config, pushLog) {
       contacts,
       leads,
       agents,
+      chatAgents,
       inboxes,
     }
   }
@@ -1368,9 +2036,14 @@ export function createBradialAdapter(config, pushLog) {
       }
     }
 
-    const contacts = (
-      await Promise.all(normalizedIds.map((contactId) => fetchContactSafely(contactId)))
-    ).filter(Boolean)
+    const contacts = []
+    const chunkSize = 4
+
+    for (let index = 0; index < normalizedIds.length; index += chunkSize) {
+      const chunk = normalizedIds.slice(index, index + chunkSize)
+      const resolvedChunk = await Promise.all(chunk.map((contactId) => fetchContactSafely(contactId).catch(() => null)))
+      contacts.push(...resolvedChunk.filter(Boolean))
+    }
 
     return {
       contacts,
@@ -1382,9 +2055,14 @@ export function createBradialAdapter(config, pushLog) {
     fetchSnapshot,
     hydrateContactsByIds,
     upsertOpportunityContact,
+    syncLinkedConversationMetadata,
     fetchConversationLabels: listConversationLabels,
     fetchChatContactLabels: listChatContactLabels,
+    fetchConversation,
+    listChatAccountLabels,
+    listAssignableChatAgents,
     opportunityLabel,
     chatEnabled,
   }
 }
+

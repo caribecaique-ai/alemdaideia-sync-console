@@ -1,5 +1,5 @@
-import fs from 'node:fs/promises'
 import path from 'node:path'
+import { readJsonStore, writeJsonStoreAtomic } from '../utils/jsonStore.js'
 
 function normalizeJobs(items) {
   return Array.isArray(items)
@@ -13,45 +13,38 @@ export function createSyncJobStore(config = {}, pushLog = () => {}) {
     path.resolve(process.cwd(), 'runtime-data', 'sync-jobs.json')
   let writeChain = Promise.resolve()
 
-  async function ensureStoreDir() {
-    await fs.mkdir(path.dirname(storePath), { recursive: true })
+  function createEmptyState() {
+    return {
+      version: 1,
+      updatedAt: null,
+      queued: [],
+      deferred: [],
+      active: [],
+      retries: [],
+    }
   }
 
   async function readState() {
-    try {
-      const raw = await fs.readFile(storePath, 'utf8')
-      const parsed = JSON.parse(raw)
-      return {
-        version: Number(parsed?.version || 1),
-        updatedAt: parsed?.updatedAt || null,
-        queued: normalizeJobs(parsed?.queued),
-        deferred: normalizeJobs(parsed?.deferred),
-        active: normalizeJobs(parsed?.active),
-        retries: normalizeJobs(parsed?.retries),
-      }
-    } catch (error) {
-      if (error.code === 'ENOENT') {
-        return {
-          version: 1,
-          updatedAt: null,
-          queued: [],
-          deferred: [],
-          active: [],
-          retries: [],
-        }
-      }
+    const parsed = await readJsonStore(storePath, createEmptyState, {
+      onCorrupt(error, corruptPath) {
+        pushLog(
+          'warning',
+          'Fila persistida de sync restaurada',
+          corruptPath
+            ? `Arquivo corrompido arquivado em ${corruptPath}.`
+            : `Falha ao ler ${storePath}; fila recriada.`,
+          { storePath, corruptPath, error: error.message },
+        )
+      },
+    })
 
-      pushLog('warning', 'Falha ao ler jobs de sync persistidos', error.message, {
-        storePath,
-      })
-      return {
-        version: 1,
-        updatedAt: null,
-        queued: [],
-        deferred: [],
-        active: [],
-        retries: [],
-      }
+    return {
+      version: Number(parsed?.version || 1),
+      updatedAt: parsed?.updatedAt || null,
+      queued: normalizeJobs(parsed?.queued),
+      deferred: normalizeJobs(parsed?.deferred),
+      active: normalizeJobs(parsed?.active),
+      retries: normalizeJobs(parsed?.retries),
     }
   }
 
@@ -65,8 +58,7 @@ export function createSyncJobStore(config = {}, pushLog = () => {}) {
       retries: normalizeJobs(state.retries),
     }
 
-    await ensureStoreDir()
-    await fs.writeFile(storePath, JSON.stringify(payload, null, 2), 'utf8')
+    await writeJsonStoreAtomic(storePath, payload)
     return payload
   }
 

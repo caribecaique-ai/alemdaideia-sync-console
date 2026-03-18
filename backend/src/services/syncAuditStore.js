@@ -1,5 +1,5 @@
-import fs from 'node:fs/promises'
 import path from 'node:path'
+import { readJsonStore, writeJsonStoreAtomic } from '../utils/jsonStore.js'
 
 function normalizeItems(items) {
   return Array.isArray(items) ? items.filter((item) => item && typeof item === 'object') : []
@@ -12,26 +12,29 @@ export function createSyncAuditStore(config = {}, pushLog = () => {}) {
   const maxItems = Math.max(100, Number(config.maxItems || 1000))
   let writeChain = Promise.resolve()
 
-  async function ensureStoreDir() {
-    await fs.mkdir(path.dirname(storePath), { recursive: true })
+  function createEmptyItems() {
+    return []
   }
 
   async function readItems() {
-    try {
-      const raw = await fs.readFile(storePath, 'utf8')
-      return normalizeItems(JSON.parse(raw))
-    } catch (error) {
-      if (error.code === 'ENOENT') return []
-      pushLog('warning', 'Falha ao ler auditoria de sync', error.message, {
-        storePath,
-      })
-      return []
-    }
+    return normalizeItems(
+      await readJsonStore(storePath, createEmptyItems, {
+        onCorrupt(error, corruptPath) {
+          pushLog(
+            'warning',
+            'Auditoria de sync restaurada',
+            corruptPath
+              ? `Arquivo corrompido arquivado em ${corruptPath}.`
+              : `Falha ao ler ${storePath}; auditoria recriada.`,
+            { storePath, corruptPath, error: error.message },
+          )
+        },
+      }),
+    )
   }
 
   async function writeItems(items) {
-    await ensureStoreDir()
-    await fs.writeFile(storePath, JSON.stringify(normalizeItems(items).slice(0, maxItems), null, 2), 'utf8')
+    await writeJsonStoreAtomic(storePath, normalizeItems(items).slice(0, maxItems))
   }
 
   function record(entry = {}) {

@@ -1,36 +1,44 @@
-import fs from 'node:fs'
-import path from 'node:path'
 import crypto from 'node:crypto'
+import { readJsonStoreSync, writeJsonStoreAtomicSync } from '../utils/jsonStore.js'
 
-function ensureStoreFile(storePath) {
-  const directory = path.dirname(storePath)
-  if (!fs.existsSync(directory)) {
-    fs.mkdirSync(directory, { recursive: true })
-  }
-
-  if (!fs.existsSync(storePath)) {
-    fs.writeFileSync(
-      storePath,
-      JSON.stringify({ version: 1, items: [] }, null, 2),
-      'utf8',
-    )
-  }
+function createEmptyStore() {
+  return { version: 1, items: [] }
 }
 
-function readStore(storePath) {
-  ensureStoreFile(storePath)
-  const raw = fs.readFileSync(storePath, 'utf8').replace(/^\uFEFF/, '')
-  const parsed = JSON.parse(raw)
-
+function normalizeStore(parsed) {
   return {
     version: 1,
     items: Array.isArray(parsed?.items) ? parsed.items : [],
   }
 }
 
-function writeStore(storePath, payload) {
-  ensureStoreFile(storePath)
-  fs.writeFileSync(storePath, JSON.stringify(payload, null, 2), 'utf8')
+function serializeIntegration(record, options = {}) {
+  const includeSecrets = options.includeSecrets === true
+  if (!record || typeof record !== 'object') return null
+
+  const serialized = {
+    integrationId: record.integrationId,
+    provider: record.provider,
+    name: record.name,
+    publicBaseUrl: record.publicBaseUrl,
+    webhookUrl: record.webhookUrl,
+    workspaceId: record.workspaceId,
+    workspaceName: record.workspaceName,
+    lists: Array.isArray(record.lists) ? record.lists : [],
+    authMode: record.authMode,
+    status: record.status,
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+    lastEventAt: record.lastEventAt,
+    clickupSecretConfigured: Boolean(record.clickupSecret),
+  }
+
+  if (includeSecrets) {
+    serialized.webhookToken = record.webhookToken
+    serialized.clickupSecret = record.clickupSecret
+  }
+
+  return serialized
 }
 
 function buildWebhookUrl(publicBaseUrl, integrationId, webhookToken) {
@@ -45,17 +53,43 @@ export function createClickupIntegrationStore(config, pushLog) {
     throw new Error('Defina um caminho para armazenar as integracoes do ClickUp.')
   }
 
-  function listIntegrations() {
-    return readStore(storePath).items
+  function readStore() {
+    return normalizeStore(
+      readJsonStoreSync(storePath, createEmptyStore, {
+        onCorrupt(error, corruptPath) {
+          pushLog(
+            'warning',
+            'Store de integracoes do ClickUp restaurada',
+            corruptPath
+              ? `Arquivo corrompido arquivado em ${corruptPath}.`
+              : `Falha ao ler ${storePath}; store recriada.`,
+            { storePath, corruptPath, error: error.message },
+          )
+        },
+      }),
+    )
   }
 
-  function findIntegration(integrationId) {
-    return listIntegrations().find((item) => item.integrationId === integrationId) || null
+  function writeStore(payload) {
+    writeJsonStoreAtomicSync(storePath, normalizeStore(payload))
+  }
+
+  function listRawIntegrations() {
+    return readStore().items
+  }
+
+  function listIntegrations(options = {}) {
+    return listRawIntegrations().map((item) => serializeIntegration(item, options))
+  }
+
+  function findIntegration(integrationId, options = {}) {
+    const item = listRawIntegrations().find((record) => record.integrationId === integrationId) || null
+    return item ? serializeIntegration(item, options) : null
   }
 
   function findByWebhookPath(integrationId, webhookToken) {
     return (
-      listIntegrations().find(
+      listRawIntegrations().find(
         (item) =>
           item.integrationId === integrationId &&
           item.webhookToken === webhookToken &&
@@ -65,7 +99,7 @@ export function createClickupIntegrationStore(config, pushLog) {
   }
 
   function createIntegration(input) {
-    const store = readStore(storePath)
+    const store = readStore()
     const now = new Date().toISOString()
     const integrationId = `int_${crypto.randomBytes(6).toString('hex')}`
     const webhookToken = `whk_${crypto.randomBytes(12).toString('hex')}`
@@ -90,17 +124,17 @@ export function createClickupIntegrationStore(config, pushLog) {
     }
 
     store.items.unshift(record)
-    writeStore(storePath, store)
+    writeStore(store)
     pushLog('success', 'Integracao ClickUp criada', `${record.name} pronta para receber webhooks.`, {
       integrationId: record.integrationId,
       authMode: record.authMode,
     })
 
-    return record
+    return serializeIntegration(record)
   }
 
   function updateIntegration(integrationId, changes = {}) {
-    const store = readStore(storePath)
+    const store = readStore()
     const index = store.items.findIndex((item) => item.integrationId === integrationId)
 
     if (index === -1) return null
@@ -128,8 +162,8 @@ export function createClickupIntegrationStore(config, pushLog) {
     }
 
     store.items[index] = updated
-    writeStore(storePath, store)
-    return updated
+    writeStore(store)
+    return serializeIntegration(updated)
   }
 
   function markIntegrationEvent(integrationId) {
